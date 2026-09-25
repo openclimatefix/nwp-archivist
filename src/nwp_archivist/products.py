@@ -128,10 +128,27 @@ class Product:
             return (None,)
         return tuple(range(1, self.n_members + 1))
 
+    def __post_init__(self) -> None:
+        """Check that every field's lead times are a subset of the longest field's."""
+        axis = set(self.step_axis)
+        for field in self.fields:
+            if not set(field.steps_minutes) <= axis:
+                message = f"{field.variable} has lead times outside {self.name}'s step axis"
+                raise ValueError(message)
+
+    @property
+    def step_axis(self) -> tuple[int, ...]:
+        """The product's `step` axis: the lead times of its longest field, in minutes."""
+        return max((field.steps_minutes for field in self.fields), key=len)
+
     @property
     def max_steps(self) -> int:
-        """The length of the padded `step` axis: the step count of the longest field."""
-        return max(len(field.steps_minutes) for field in self.fields)
+        """The length of the `step` axis."""
+        return len(self.step_axis)
+
+    def step_index(self, step_minutes: int) -> int:
+        """The position of a lead time on the `step` axis."""
+        return self.step_axis.index(step_minutes)
 
     @property
     def cycle(self) -> timedelta:

@@ -39,7 +39,7 @@ TINY_EPS = Product(
     # The two variables have different step lists, so the padded step axis is exercised.
     fields=(
         Field("T_2M", "T_2M", "2t", (0, 60, 120)),
-        Field("U_10M", "U_10M", "10u", (0, 60)),
+        Field("U_10M", "U_10M", "10u", (0, 120)),
     ),
     hhl_levels=(),
     start_delay_hours=1.0,
@@ -94,7 +94,8 @@ def make_grib(
 def data_values(file: ExpectedFile) -> np.ndarray:
     """The synthetic values of a data file, distinct for every variable, member, and step."""
     seed = (file.member or 0) * 100 + file.step_minutes // 60 * 10 + len(file.field.variable)
-    return (np.arange(len(CLAT), dtype=np.float32) + 280.0 + seed).astype(np.float32)
+    # The fraction is not exactly representable in 13 significand bits, so rounding changes it.
+    return (np.arange(len(CLAT), dtype=np.float32) + 280.123456 + seed).astype(np.float32)
 
 
 @dataclass

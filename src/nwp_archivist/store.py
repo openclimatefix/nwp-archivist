@@ -55,7 +55,7 @@ STATUS_NAMES: Final[dict[int, str]] = {
 _INIT_TIME_CHUNK: Final[int] = 1024
 
 _MAIN_BRANCH: Final[str] = "main"
-_LAYOUT_VERSION: Final[int] = 1
+_LAYOUT_VERSION: Final[int] = 2
 
 
 def round_significand(values: np.ndarray, *, keep_bits: int = SIGNIFICAND_BITS) -> np.ndarray:
@@ -275,6 +275,8 @@ class ProductStore:
         group = self._read_group()
         if group is None or "status" not in group:
             return None
+        if group.attrs.get("layout_version") != _LAYOUT_VERSION:
+            return "the stored layout version differs from this code's"
         stored = group.attrs.get("variables")
         if stored != self._variable_steps():
             return "the stored variables or step lists differ from the product table"
@@ -308,7 +310,6 @@ class ProductStore:
         group = zarr.open_group(session.store, mode="w")
         n_cells = len(grid.cell_index)
         n_steps = product.max_steps
-        longest = max(product.fields, key=lambda field: len(field.steps_minutes))
         group.attrs.update(
             {
                 "layout_version": _LAYOUT_VERSION,
@@ -327,9 +328,9 @@ class ProductStore:
                 "slot_epoch": SLOT_EPOCH.isoformat(),
                 "status_codes": {str(code): name for code, name in STATUS_NAMES.items()},
                 "variables": self._variable_steps(),
-                "step_padding": (
-                    "Each variable has its own lead times in step_of_<variable>, in minutes. "
-                    "Entries beyond a variable's last lead time are -1, and the data there is NaN."
+                "step_note": (
+                    "Every variable is placed at its own lead times on the shared step axis. "
+                    "Lead times a variable does not have are NaN."
                 ),
                 "shortwave_note": (
                     "ASWDIR_S and ASWDIFD_S are averages since the start of the run, as delivered."
@@ -365,7 +366,7 @@ class ProductStore:
         _write_static(
             group,
             "step",
-            np.array(longest.steps_minutes, dtype=np.int32),
+            np.array(product.step_axis, dtype=np.int32),
             dims=("step",),
         )
         _array(group, "step").attrs["units"] = "minutes"
@@ -380,10 +381,6 @@ class ProductStore:
             _write_static(group, name, values.astype(np.float32), dims=("cell",))
 
         for field in product.fields:
-            padded = np.full(n_steps, -1, dtype=np.int32)
-            padded[: len(field.steps_minutes)] = field.steps_minutes
-            _write_static(group, f"step_of_{field.variable}", padded, dims=("step",))
-            _array(group, f"step_of_{field.variable}").attrs["units"] = "minutes"
             if product.n_members is None:
                 shape: tuple[int, ...] = (0, n_steps, n_cells)
                 chunks: tuple[int, ...] = (1, n_steps, n_cells)
@@ -403,7 +400,6 @@ class ProductStore:
                 attributes={
                     "dwd_parameter": field.parameter,
                     "model_level": field.level,
-                    "step_coordinate": f"step_of_{field.variable}",
                 },
             )
         session.commit(f"Create the {product.name} archive layout", allow_empty=True)
@@ -436,10 +432,10 @@ class ProductStore:
             array = _array(group, field.variable)
             for member in product.members:
                 block = np.full((n_steps, n_cells), np.nan, dtype=np.float32)
-                for index, step in enumerate(field.steps_minutes):
+                for step in field.steps_minutes:
                     values = run.load(field.variable, member, step)
                     if values is not None:
-                        block[index] = values
+                        block[product.step_index(step)] = values
                 block = round_significand(block)
                 if member is None:
                     array[slot] = block

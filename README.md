@@ -52,12 +52,13 @@ import xarray as xr
 repo = icechunk.Repository.open(
     icechunk.local_filesystem_storage("/mnt/data/nwp-archive/icon-d2-eps")
 )
-dataset = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
+session = repo.readonly_session("main")
+dataset = xr.open_zarr(session.store, consolidated=False, decode_timedelta=True)
 ```
 
 The `status` array says whether each `init_time` slot is `complete` (1), `partial` (2), or `missing`
-(3); 0 means never archived. The lead times of a variable are in its `step_of_<variable>` array, in
-minutes. Shortwave radiation (`ASWDIR_S`, `ASWDIFD_S`) is an average since the start of the run, as
+(3); 0 means never archived. The `step` coordinate is in minutes, and a variable that lacks a
+lead time has NaN at that position. Shortwave radiation (`ASWDIR_S`, `ASWDIFD_S`) is an average since the start of the run, as
 delivered.
 
 ## Tests

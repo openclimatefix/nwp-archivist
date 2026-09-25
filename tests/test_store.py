@@ -11,7 +11,7 @@ import zarr
 from support import CLAT, CLON, INIT, N_KEPT_CELLS, TINY_DETERMINISTIC, TINY_EPS
 
 from nwp_archivist.cache import RunGrid
-from nwp_archivist.products import Field, Product
+from nwp_archivist.products import ICON_D2, Field, Product
 from nwp_archivist.store import (
     STATUS_COMPLETE,
     STATUS_PARTIAL,
@@ -24,6 +24,11 @@ from nwp_archivist.store import (
 )
 
 Loader = Callable[[str, int | None, int], np.ndarray | None]
+
+
+def _lead(amount: int, unit: str) -> np.ndarray:
+    """A lead time in the nanosecond unit xarray uses for its `step` index."""
+    return np.timedelta64(amount, unit).astype("timedelta64[ns]")  # ty: ignore[no-matching-overload]
 
 
 def _grid(clat: np.ndarray = CLAT, clon: np.ndarray = CLON) -> RunGrid:
@@ -45,7 +50,9 @@ def _source(product: Product, seed: float) -> Loader:
         if step not in field.steps_minutes:
             return None
         base = seed + (member or 0) * 100 + step / 60 * 10 + len(variable)
-        return (np.arange(N_KEPT_CELLS, dtype=np.float32) + np.float32(base)).astype(np.float32)
+        return (np.arange(N_KEPT_CELLS, dtype=np.float32) + np.float32(base) + 0.123456).astype(
+            np.float32
+        )
 
     return load
 
@@ -126,16 +133,16 @@ def test_slot_for_counts_whole_cycles_from_the_epoch() -> None:
         slot_for(TINY_EPS, datetime(2026, 1, 1, 3, tzinfo=UTC))
 
 
-def test_a_committed_run_reads_back_rounded_with_padding(store: ProductStore) -> None:
+def test_a_committed_run_reads_back_rounded_at_its_own_lead_times(store: ProductStore) -> None:
     store.initialise(_grid())
     store.commit_run(_run(TINY_EPS, INIT))
     slot = slot_for(TINY_EPS, INIT)
     expected = round_significand(np.asarray(_source(TINY_EPS, 280.0)("T_2M", 2, 60)))
     np.testing.assert_array_equal(_read(store, "T_2M")[slot, 1, 1, :], expected)
-    # U_10M has two steps, so the third step is NaN padding.
-    assert np.isnan(_read(store, "U_10M")[slot, 0, 2, :]).all()
-    assert _read(store, "step_of_U_10M").tolist() == [0, 60, -1]
-    assert _read(store, "step_of_T_2M").tolist() == [0, 60, 120]
+    # U_10M has no 60-minute step, so that position on the shared axis is NaN.
+    assert np.isnan(_read(store, "U_10M")[slot, 0, 1, :]).all()
+    assert not np.isnan(_read(store, "U_10M")[slot, 0, 2, :]).any()
+    assert _read(store, "step").tolist() == [0, 60, 120]
 
 
 def test_status_arrays_record_the_run(store: ProductStore) -> None:
@@ -213,7 +220,7 @@ def test_a_deterministic_product_has_no_member_dimension(tmp_path: Path) -> None
     store.initialise(_grid())
     store.commit_run(_run(TINY_DETERMINISTIC, INIT))
     session = store.repository.readonly_session(branch="main")
-    dataset = xr.open_zarr(session.store, consolidated=False)
+    dataset = xr.open_zarr(session.store, consolidated=False, decode_timedelta=True)
     assert dataset["T_2M"].dims == ("init_time", "step", "cell")
     assert "member" not in dataset
 
@@ -278,11 +285,16 @@ def test_xarray_opens_the_archive_with_decoded_time_coordinates(store: ProductSt
     store.initialise(_grid())
     store.commit_run(_run(TINY_EPS, INIT))
     session = store.repository.readonly_session(branch="main")
-    dataset = xr.open_zarr(session.store, consolidated=False)
+    dataset = xr.open_zarr(session.store, consolidated=False, decode_timedelta=True)
     assert dataset["T_2M"].dims == ("init_time", "member", "step", "cell")
     assert np.datetime64("2026-09-25T06:00") in dataset["init_time"].values
     assert dataset["step"].values[1] == np.timedelta64(60, "m")
-    assert "step_of_T_2M" in dataset
+    assert (
+        dataset["U_10M"]
+        .sel(init_time=np.datetime64("2026-09-25T06:00"), step=_lead(120, "m"))
+        .notnull()
+        .all()
+    )
 
 
 def test_a_local_repository_copied_object_by_object_to_s3_opens_identically(
@@ -303,10 +315,49 @@ def test_a_local_repository_copied_object_by_object_to_s3_opens_identically(
         location=StoreLocation(root="s3://archive/nwp", s3_endpoint_url=s3_endpoint),
         product=TINY_EPS,
     )
-    for name in ("T_2M", "U_10M", "status", "init_time", "clat", "step_of_U_10M"):
+    for name in ("T_2M", "U_10M", "status", "init_time", "clat", "step"):
         np.testing.assert_array_equal(_read(store, name), _read(remote, name))
     assert remote.is_archived(INIT)
     # The copy is a working repository, not only a readable one: a new run appends to it.
     later = INIT + timedelta(hours=6)
     remote.commit_run(_run(TINY_EPS, later))
     assert remote.is_archived(later)
+
+
+def test_a_field_with_fewer_steps_reads_back_at_its_own_lead_time(tmp_path: Path) -> None:
+    # ICON-D2 hourly fields sit inside its 15-minute axis, so 48 h is index 192, not 48.
+    store = ProductStore.open(location=StoreLocation(root=str(tmp_path)), product=ICON_D2)
+
+    def load(variable: str, member: int | None, step: int) -> np.ndarray | None:
+        return np.full(N_KEPT_CELLS, step / 60, dtype=np.float32)
+
+    store.initialise(_grid())
+    store.commit_run(_run(ICON_D2, INIT, load=load))
+    session = store.repository.readonly_session(branch="main")
+    dataset = xr.open_zarr(session.store, consolidated=False, decode_timedelta=True)
+    run = dataset.sel(init_time=np.datetime64("2026-09-25T06:00"))
+    np.testing.assert_array_equal(
+        run["T_2M"].sel(step=_lead(48, "h")).values, np.full(N_KEPT_CELLS, 48.0)
+    )
+    assert np.isnan(run["T_2M"].sel(step=_lead(15, "m")).values).all()
+    assert run["ASWDIR_S"].sel(step=_lead(15, "m")).notnull().all()
+
+
+def test_an_archive_with_another_layout_version_is_a_layout_mismatch(
+    store: ProductStore, tmp_path: Path
+) -> None:
+    store.initialise(_grid())
+    session = store.repository.writable_session(branch="main")
+    group = zarr.open_group(session.store, mode="r+")
+    group.attrs["layout_version"] = 1
+    session.commit("pretend this is the old layout")
+    other = ProductStore.open(location=StoreLocation(root=str(tmp_path)), product=TINY_EPS)
+    assert other.layout_mismatch() is not None
+
+
+def test_a_product_whose_field_steps_are_not_on_its_axis_is_rejected() -> None:
+    with pytest.raises(ValueError, match="step axis"):
+        replace(
+            TINY_EPS,
+            fields=(Field("A", "A", "2t", (0, 60)), Field("B", "B", "2t", (0, 30, 90, 120))),
+        )
