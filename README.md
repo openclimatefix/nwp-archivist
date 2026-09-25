@@ -58,8 +58,8 @@ dataset = xr.open_zarr(session.store, consolidated=False, decode_timedelta=True)
 
 The `status` array says whether each `init_time` slot is `complete` (1), `partial` (2), or `missing`
 (3); 0 means never archived. The `step` coordinate is in minutes, and a variable that lacks a
-lead time has NaN at that position. Shortwave radiation (`ASWDIR_S`, `ASWDIFD_S`) is an average since the start of the run, as
-delivered.
+lead time has NaN at that position. Shortwave radiation (`ASWDIR_S`, `ASWDIFD_S`) is an average
+since the start of the run, as delivered.
 
 ## Tests
 
