@@ -87,3 +87,21 @@ def test_the_sentry_reporter_sends_a_cron_check_in(envelopes: list[Envelope]) ->
     assert {item["monitor_slug"] for item in _items(envelopes, "check_in")} == {
         "nwp-archive-record"
     }
+
+
+def test_a_logged_error_does_not_become_an_untagged_sentry_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[Envelope] = []
+    monkeypatch.setenv("SENTRY_DSN", "http://key@localhost/1")
+    reporter = make_reporter(transport=_CapturingTransport(sent))
+    assert isinstance(reporter, SentryReporter)
+    try:
+        logging.getLogger("nwp_archivist.recorder").error("commit failed")
+        reporter.fault(product="icon-d2", init_time=INIT, fault="partial", detail="99 of 100")
+        sentry_sdk.get_client().flush()
+        events = _items(sent, "event")
+    finally:
+        sentry_sdk.get_client().close()
+        sentry_sdk.init()
+    assert [event["tags"]["fault"] for event in events] == ["partial"]

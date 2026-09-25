@@ -110,6 +110,7 @@ class FakeProvider:
         clat: The cell latitudes served, replaceable to simulate a grid change.
         clon: The cell longitudes served.
         static_available: Whether the static files are published yet.
+        failures: How many more times each URL answers 503 before it answers normally.
     """
 
     product: Product
@@ -119,6 +120,7 @@ class FakeProvider:
     clat: np.ndarray = field(default_factory=CLAT.copy)
     clon: np.ndarray = field(default_factory=CLON.copy)
     static_available: bool = True
+    failures: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Index the files of the runs the tests use."""
@@ -133,6 +135,9 @@ class FakeProvider:
         """Answer one request."""
         url = str(request.url)
         self.requests.append(url)
+        if self.failures.get(url, 0) > 0:
+            self.failures[url] -= 1
+            return httpx.Response(503)
         if url in self.overrides:
             return self.overrides[url]
         match = re.search(r"/r/(\d{4}-\d\d-\d\dT\d\d)%3A00", url)

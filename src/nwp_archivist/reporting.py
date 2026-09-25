@@ -11,6 +11,8 @@ from typing import Final, Literal, Protocol
 
 import sentry_sdk
 from sentry_sdk.crons import capture_checkin
+from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.transport import Transport
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +95,11 @@ class SentryReporter:
         capture_checkin(monitor_slug=CRON_MONITOR_SLUG, status="ok" if ok else "error")
 
 
-def make_reporter() -> Reporter:
+def make_reporter(*, transport: Transport | None = None) -> Reporter:
     """Build the reporter the environment asks for.
+
+    Args:
+        transport: A replacement for Sentry's network transport, for tests.
 
     Returns:
         A `SentryReporter` (after initialising the SDK) if `SENTRY_DSN` is set and non-empty,
@@ -103,5 +108,12 @@ def make_reporter() -> Reporter:
     dsn = os.environ.get("SENTRY_DSN", "")
     if not dsn:
         return LogReporter()
-    sentry_sdk.init(dsn=dsn, traces_sample_rate=0.0)
+    # Logged errors would become a second event with none of the product, run or fault tags, so
+    # only `SentryReporter` sends events.
+    sentry_sdk.init(
+        dsn=dsn,
+        traces_sample_rate=0.0,
+        integrations=[LoggingIntegration(event_level=None)],
+        transport=transport,
+    )
     return SentryReporter()
