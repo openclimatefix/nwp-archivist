@@ -142,10 +142,6 @@ class Product:
         """The time after which the recorder commits whatever has arrived for a run."""
         return init_time + timedelta(hours=self.deadline_hours)
 
-    def start_time(self, init_time: datetime) -> datetime:
-        """The time from which the recorder fetches the files of a run."""
-        return init_time + timedelta(hours=self.start_delay_hours)
-
     def field_by_variable(self, variable: str) -> Field:
         """Look a variable up by its archive name."""
         for field in self.fields:
