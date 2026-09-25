@@ -5,6 +5,7 @@ standard output, where journald captures it.
 """
 
 import argparse
+import fcntl
 import logging
 import os
 import sys
@@ -23,6 +24,7 @@ from nwp_archivist.store import StoreLocation
 
 DEFAULT_CACHE_DIR: Final[str] = "/mnt/data/nwp-archive-cache"
 REQUEST_TIMEOUT_SECONDS: Final[float] = 60.0
+LOCK_FILE_NAME: Final[str] = ".lock"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -93,8 +95,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_free_bytes=int(args.min_free_gib * 1024**3),
         workers=args.workers,
     )
-    limits = httpx.Limits(max_connections=args.workers, max_keepalive_connections=args.workers)
-    with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, limits=limits) as client:
-        recorder = Recorder(config=config, fetcher=Fetcher(client=client), reporter=make_reporter())
-        recorder.run_cycle([PRODUCTS[name] for name in args.products])
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Two cycles at once could lose an Icechunk commit on local storage and corrupt cache files, so
+    # only one process runs at a time. The lock is released when the process exits.
+    with (cache_dir / LOCK_FILE_NAME).open("w") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logging.getLogger(__name__).info(
+                "another archive-record run holds the lock on %s; exiting", cache_dir
+            )
+            return 0
+        limits = httpx.Limits(max_connections=args.workers, max_keepalive_connections=args.workers)
+        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, limits=limits) as client:
+            recorder = Recorder(
+                config=config, fetcher=Fetcher(client=client), reporter=make_reporter()
+            )
+            recorder.run_cycle([PRODUCTS[name] for name in args.products])
     return 0

@@ -1,3 +1,5 @@
+import fcntl
+import logging
 from pathlib import Path
 from typing import ClassVar
 
@@ -61,3 +63,27 @@ def test_the_products_flag_selects_products(tmp_path: Path) -> None:
 
 def test_the_default_cache_directory_is_on_the_data_disk() -> None:
     assert cli.build_parser().parse_args([]).cache_dir == "/mnt/data/nwp-archive-cache"
+
+
+def test_a_second_process_exits_zero_when_another_holds_the_lock(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "c").mkdir()
+    with (tmp_path / "c" / ".lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with caplog.at_level(logging.INFO):
+            code = cli.main(
+                ["--store-root", str(tmp_path / "s"), "--cache-dir", str(tmp_path / "c")]
+            )
+    assert code == 0
+    assert _StubRecorder.instances == []
+    assert [r.getMessage() for r in caplog.records if "lock" in r.getMessage()] == [
+        f"another archive-record run holds the lock on {tmp_path / 'c'}; exiting"
+    ]
+
+
+def test_the_lock_is_released_when_a_cycle_ends(tmp_path: Path) -> None:
+    arguments = ["--store-root", str(tmp_path / "s"), "--cache-dir", str(tmp_path / "c")]
+    cli.main(arguments)
+    cli.main(arguments)
+    assert len(_StubRecorder.instances) == 2
