@@ -3,8 +3,9 @@
 An always-on recorder of ensemble numerical weather prediction (NWP) products that their providers
 delete within 24 hours to 33 days. It records the DWD ICON-EU-EPS, ICON-D2-EPS, ICON-D2, and
 ICON-ART-EU products, cropped to Great Britain and its surrounding seas (49.0-61.5 N, 10.0 W-3.5 E),
-into one [Icechunk](https://icechunk.io) repository per product. The Met Office MOGREPS-UK ensemble
-is planned. The design, its reviews, and the plan are in
+into one [Icechunk](https://icechunk.io) repository per product. It also records the Met Office
+MOGREPS-UK ensemble (`mogreps-uk`, 3 members, hourly runs to 126 hours) as a separate product
+because of its licence. The design, its reviews, and the plan are in
 [openclimatefix/nged-substation-forecast#926](https://github.com/openclimatefix/nged-substation-forecast/issues/926).
 
 ## Licences
@@ -39,6 +40,30 @@ number of files expected and received, and the state (`waiting`, `complete`, `pa
 If a product's grid, member count, or step list differs from the archive's, the recorder stops
 committing that product, reports one `grid_changed` fault, and creates `<cache-dir>/<product>/HALTED`.
 Delete that file once a person has decided what to do.
+
+## MOGREPS-UK
+
+`archive-record --products mogreps-uk` records the Met Office's public bucket
+`met-office-uk-ensemble-model-data`, which deletes each file about 30 days after it was written. The
+`deploy/nwp-archive-mogreps.service` and `.timer` run it every 30 minutes with a cache directory of
+its own.
+
+- **Fields**, all as delivered: total, direct, and diffuse downward shortwave at the surface, screen
+  temperature, 10 m wind speed and direction, total cloud amount, and wind speed and direction at
+  100 m. Shortwave has no lead time 0 and carries no `cell_methods` or time bounds, so it is taken
+  to be instantaneous.
+- **Grid:** the native 2 km grid, cut to the smallest rectangle of rows and columns that contains
+  the crop box (707 rows by 494 columns), flattened row by row into the `cell` dimension. The
+  `grid_shape` attribute holds the rows and columns.
+- **Members** are numbered 1 to 3 in file order. The `realization` array holds the Met Office's
+  number for each member, which changes from run to run.
+- **Reading** downloads only the chunks that overlap the rectangle, by byte range, so a run costs
+  about 2 GB of downloads and about 1.5 GB of archive.
+- **Backfill:** each cycle handles the runs from the last 6 hours first. It then spends at most
+  `--backfill-minutes` (default 15) on older runs still in the bucket, newest first, with fewer
+  download threads. A run with no file at all is recorded `missing` only 29 days after its
+  initialisation time, and until then it is looked at again after a delay that doubles from 30
+  minutes to 12 hours.
 
 ## Reading the archive
 
