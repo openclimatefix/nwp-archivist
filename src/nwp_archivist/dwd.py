@@ -309,6 +309,7 @@ class DwdSource:
         outcome = self.fetcher.fetch(file.url, expect=expect)
         if isinstance(outcome, NotYet):
             return outcome
+        # A file of another size is passed on uncropped, so that the recorder sees the mismatch.
         return Cropped(
             values=outcome.values[grid.cell_index]
             if len(outcome.values) == grid.n_points

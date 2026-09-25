@@ -57,8 +57,9 @@ its own.
   `grid_shape` attribute holds the rows and columns.
 - **Members** are numbered 1 to 3 in file order. The `realization` array holds the Met Office's
   number for each member, which changes from run to run.
-- **Reading** downloads only the chunks that overlap the rectangle, by byte range, so a run costs
-  about 2 GB of downloads and about 1.5 GB of archive.
+- **Reading** downloads only the chunks that overlap the rectangle, by byte range. One measured run
+  took 5.5 GB of downloads in 54,000 requests and 29 minutes with 8 threads, and became 1.06 GB of
+  archive.
 - **Backfill:** each cycle handles the runs from the last 6 hours first. It then spends at most
   `--backfill-minutes` (default 15) on older runs still in the bucket, newest first, with fewer
   download threads. A run with no file at all is recorded `missing` only 29 days after its
