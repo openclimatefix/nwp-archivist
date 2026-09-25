@@ -7,8 +7,10 @@ cache, are the record of what is committed: the "done" markers here only save a 
 
 import io
 import json
+import zipfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,7 @@ from nwp_archivist.products import ExpectedFile
 
 _GRID_FILE = "grid.npz"
 _META_FILE = "meta.json"
+_FAULTS_FILE = "active_faults.json"
 _TIMESTAMP_FORMAT = "%Y%m%dT%H%M"
 
 
@@ -29,11 +32,31 @@ def _write_atomically(path: Path, data: bytes) -> None:
     temporary.replace(path)
 
 
+_UNREADABLE = (OSError, ValueError, EOFError, zipfile.BadZipFile)
+
+
+def _load_or_delete(path: Path) -> np.ndarray | None:
+    """Read an `.npy` file, or delete it and return `None` if it is absent or unreadable."""
+    try:
+        return np.load(path, allow_pickle=False)
+    except FileNotFoundError:
+        return None
+    except _UNREADABLE:
+        path.unlink(missing_ok=True)
+        return None
+
+
 def _array_bytes(values: np.ndarray) -> bytes:
     """Serialise an array in `.npy` format."""
     buffer = io.BytesIO()
     np.save(buffer, values, allow_pickle=False)
     return buffer.getvalue()
+
+
+@lru_cache(maxsize=8)
+def _npy_size(n_cells: int) -> int:
+    """The size in bytes of a cached file holding `n_cells` `float32` values."""
+    return len(_array_bytes(np.zeros(n_cells, dtype=np.float32)))
 
 
 @dataclass(frozen=True)
@@ -62,13 +85,23 @@ class RunCache:
     def _file_path(self, *, variable: str, member: int | None, step_minutes: int) -> Path:
         return self.directory / variable / f"{member or 0:02d}_{step_minutes:04d}.npy"
 
-    def has(self, file: ExpectedFile) -> bool:
-        """Whether the file's cropped values are cached."""
-        return self._file_path(
-            variable=file.field.variable,
-            member=file.member,
-            step_minutes=file.step_minutes,
-        ).exists()
+    def has(self, file: ExpectedFile, *, n_cells: int) -> bool:
+        """Whether the file's cropped values are cached whole.
+
+        A file of the wrong size (a write cut short by a crash, or an empty file left by a power
+        loss) is deleted, so that the next fetch pass downloads it again.
+        """
+        path = self._file_path(
+            variable=file.field.variable, member=file.member, step_minutes=file.step_minutes
+        )
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        if size != _npy_size(n_cells):
+            path.unlink(missing_ok=True)
+            return False
+        return True
 
     def save(self, file: ExpectedFile, values: np.ndarray) -> None:
         """Cache the cropped values of one file."""
@@ -80,15 +113,16 @@ class RunCache:
         _write_atomically(path, _array_bytes(values))
 
     def load(self, *, variable: str, member: int | None, step_minutes: int) -> np.ndarray | None:
-        """Read the cropped values of one file, or `None` if it was never received."""
-        path = self._file_path(variable=variable, member=member, step_minutes=step_minutes)
-        if not path.exists():
-            return None
-        return np.load(path, allow_pickle=False)
+        """Read the cropped values of one file, or `None` if it is absent or unreadable.
 
-    def count_received(self, files: list[ExpectedFile]) -> int:
-        """Count how many of `files` are cached."""
-        return sum(1 for file in files if self.has(file))
+        An unreadable file is deleted, so that the next fetch pass downloads it again.
+        """
+        path = self._file_path(variable=variable, member=member, step_minutes=step_minutes)
+        return _load_or_delete(path)
+
+    def count_received(self, files: list[ExpectedFile], *, n_cells: int) -> int:
+        """Count how many of `files` are cached whole."""
+        return sum(1 for file in files if self.has(file, n_cells=n_cells))
 
     def save_grid(self, grid: RunGrid) -> None:
         """Cache the run's cropped grid."""
@@ -102,21 +136,28 @@ class RunCache:
         _write_atomically(self.directory / _GRID_FILE, buffer.getvalue())
 
     def load_grid(self) -> RunGrid | None:
-        """Read the run's cropped grid, or `None` if it was never cached."""
+        """Read the run's cropped grid, or `None` if it is absent or unreadable.
+
+        An unreadable file is deleted, so that the grid is fetched again.
+        """
         path = self.directory / _GRID_FILE
-        if not path.exists():
+        try:
+            with np.load(path, allow_pickle=False) as stored:
+                statics = {
+                    key.removeprefix("static_"): stored[key]
+                    for key in stored.files
+                    if key.startswith("static_")
+                }
+                return RunGrid(
+                    n_points=int(stored["n_points"]),
+                    cell_index=stored["cell_index"],
+                    statics=statics,
+                )
+        except FileNotFoundError:
             return None
-        with np.load(path, allow_pickle=False) as stored:
-            statics = {
-                key.removeprefix("static_"): stored[key]
-                for key in stored.files
-                if key.startswith("static_")
-            }
-            return RunGrid(
-                n_points=int(stored["n_points"]),
-                cell_index=stored["cell_index"],
-                statics=statics,
-            )
+        except _UNREADABLE:
+            path.unlink(missing_ok=True)
+            return None
 
     def save_generating_process(self, generating_process: int) -> None:
         """Remember the generating process identifier of the run's first decoded file."""
@@ -128,9 +169,13 @@ class RunCache:
     def load_generating_process(self) -> int | None:
         """The remembered generating process identifier, or `None`."""
         path = self.directory / _META_FILE
-        if not path.exists():
+        try:
+            return int(json.loads(path.read_text())["generating_process"])
+        except FileNotFoundError:
             return None
-        return int(json.loads(path.read_text())["generating_process"])
+        except (*_UNREADABLE, KeyError):
+            path.unlink(missing_ok=True)
+            return None
 
     def delete(self) -> None:
         """Delete the run's cached files, after its commit succeeded."""
@@ -155,6 +200,19 @@ class ProductCache:
         """The cache of one run."""
         return RunCache(directory=self.directory / "runs" / init_time.strftime(_TIMESTAMP_FORMAT))
 
+    def cached_runs(self) -> list[datetime]:
+        """The init times of every run that still has a cache directory, oldest first."""
+        runs_directory = self.directory / "runs"
+        if not runs_directory.exists():
+            return []
+        times: list[datetime] = []
+        for path in runs_directory.iterdir():
+            try:
+                times.append(datetime.strptime(path.name, _TIMESTAMP_FORMAT).replace(tzinfo=UTC))
+            except ValueError:
+                continue
+        return sorted(times)
+
     def is_done(self, init_time: datetime) -> bool:
         """Whether the run was committed, according to this cache."""
         return (self.directory / "done" / init_time.strftime(_TIMESTAMP_FORMAT)).exists()
@@ -176,3 +234,14 @@ class ProductCache:
     def halt(self, reason: str) -> None:
         """Stop commits for this product until a person deletes the `HALTED` file."""
         _write_atomically(self._halt_path, reason.encode())
+
+    def load_active_faults(self) -> set[str]:
+        """The keys of the persistent faults reported and not yet cleared."""
+        try:
+            return set(json.loads((self.directory / _FAULTS_FILE).read_text()))
+        except (FileNotFoundError, *_UNREADABLE):
+            return set()
+
+    def save_active_faults(self, keys: set[str]) -> None:
+        """Remember which persistent faults are active, so the next cycle does not repeat them."""
+        _write_atomically(self.directory / _FAULTS_FILE, json.dumps(sorted(keys)).encode())
