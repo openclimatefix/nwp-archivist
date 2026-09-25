@@ -19,6 +19,8 @@ from nwp_archivist.products import ExpectedFile
 
 _GRID_FILE = "grid.npz"
 _META_FILE = "meta.json"
+_MEMBERS_FILE = "members.json"
+_BACKOFF_FILE = "backoff.json"
 _FAULTS_FILE = "active_faults.json"
 _TIMESTAMP_FORMAT = "%Y%m%dT%H%M"
 
@@ -68,11 +70,14 @@ class RunGrid:
         cell_index: The indices of the kept cells within the full grid.
         statics: The cropped static fields (`clat`, `clon`, and, when fetched, `hsurf`,
             `fr_land` and the half-level heights), keyed by their archive name.
+        shape: The number of rows and columns of the kept cells, when they are a rectangle of a
+            regular grid.
     """
 
     n_points: int
     cell_index: np.ndarray
     statics: dict[str, np.ndarray]
+    shape: tuple[int, int] | None = None
 
 
 class RunCache:
@@ -131,6 +136,8 @@ class RunCache:
             "n_points": np.asarray(grid.n_points, dtype=np.int64),
             "cell_index": grid.cell_index,
         }
+        if grid.shape is not None:
+            contents["shape"] = np.asarray(grid.shape, dtype=np.int64)
         contents.update({f"static_{name}": values for name, values in grid.statics.items()})
         np.savez(buffer, **contents)  # ty: ignore[invalid-argument-type]
         _write_atomically(self.directory / _GRID_FILE, buffer.getvalue())
@@ -152,6 +159,11 @@ class RunCache:
                     n_points=int(stored["n_points"]),
                     cell_index=stored["cell_index"],
                     statics=statics,
+                    shape=(
+                        (int(stored["shape"][0]), int(stored["shape"][1]))
+                        if "shape" in stored.files
+                        else None
+                    ),
                 )
         except FileNotFoundError:
             return None
@@ -174,6 +186,40 @@ class RunCache:
         except FileNotFoundError:
             return None
         except (*_UNREADABLE, KeyError):
+            path.unlink(missing_ok=True)
+            return None
+
+    def save_member_ids(self, member_ids: tuple[int, ...]) -> None:
+        """Remember the provider's numbers for the run's members, in member order."""
+        _write_atomically(self.directory / _MEMBERS_FILE, json.dumps(member_ids).encode())
+
+    def load_member_ids(self) -> tuple[int, ...] | None:
+        """The remembered member numbers, or `None`."""
+        path = self.directory / _MEMBERS_FILE
+        try:
+            return tuple(int(number) for number in json.loads(path.read_text()))
+        except FileNotFoundError:
+            return None
+        except (*_UNREADABLE, TypeError):
+            path.unlink(missing_ok=True)
+            return None
+
+    def save_backoff(self, *, attempts: int, next_try: datetime) -> None:
+        """Remember that a pass found nothing of this run, and when to look again."""
+        _write_atomically(
+            self.directory / _BACKOFF_FILE,
+            json.dumps({"attempts": attempts, "next_try": next_try.isoformat()}).encode(),
+        )
+
+    def load_backoff(self) -> tuple[int, datetime] | None:
+        """The number of empty passes so far and when to look again, or `None`."""
+        path = self.directory / _BACKOFF_FILE
+        try:
+            stored = json.loads(path.read_text())
+            return int(stored["attempts"]), datetime.fromisoformat(stored["next_try"])
+        except FileNotFoundError:
+            return None
+        except (*_UNREADABLE, KeyError, TypeError):
             path.unlink(missing_ok=True)
             return None
 

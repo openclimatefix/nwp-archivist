@@ -10,6 +10,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Final
 
 DWD_BASE_URL: Final[str] = "https://opendata.dwd.de/weather/nwp/v1/m"
+MOGREPS_BASE_URL: Final[str] = (
+    "https://met-office-uk-ensemble-model-data.s3.eu-west-2.amazonaws.com/uk-ensemble"
+)
 
 # The "fat Great Britain" box, chosen so that it reaches offshore wind farms. It covers Northern
 # Ireland, the Irish Sea, the Celtic Sea off Cornwall, the seas west of the Hebrides, Shetland, and
@@ -63,11 +66,13 @@ class Field:
 
     Attributes:
         variable: The name of the variable's array in the archive, such as `T_2M` or `U_L63`.
-        parameter: The DWD parameter directory name, such as `T_2M` or `U`.
-        short_name: The `shortName` eccodes reports for the decoded message, which the decoder
-            checks against the file's URL.
+        parameter: The provider's name for the variable in the file's address, such as `T_2M` or
+            `U` for DWD, or `temperature_at_screen_level` for MOGREPS-UK.
+        short_name: The name the decoded file gives the variable (`shortName` in a DWD GRIB2
+            message, the dataset name in a MOGREPS-UK file), which the decoder checks.
         steps_minutes: The lead times the provider publishes for this variable, in minutes.
-        level: The model level, or `None` for a surface or fixed-height field.
+        level: The DWD model level, or the height in metres of a MOGREPS-UK height-level field,
+            or `None` for a surface field.
     """
 
     variable: str
@@ -86,12 +91,14 @@ class ExpectedFile:
         member: The ensemble member number (from 1), or `None` for a deterministic product.
         step_minutes: The lead time in minutes.
         url: The address of the file.
+        init_time: The initialisation time of the run the file belongs to.
     """
 
     field: Field
     member: int | None
     step_minutes: int
     url: str
+    init_time: datetime
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,18 @@ class Product:
         start_delay_hours: How long after the initialisation time the recorder starts fetching.
         deadline_hours: How long after the initialisation time the recorder commits whatever has
             arrived. It is set from how long the provider keeps a run.
+        source: Which provider's files these are: `dwd` or `mogreps`.
+        lookback_hours: How far back from now a cycle looks for runs that are not yet archived,
+            or `None` for the recorder's default.
+        missing_after_hours: How long after the initialisation time a run with no file at all is
+            recorded as `missing`, or `None` for the same as `deadline_hours`.
+        live_hours: Runs younger than this are live and are handled first; older runs are a
+            backfill that the recorder handles newest first, within a time budget. `None` means
+            every run is live.
+        cell_chunk: The number of cells in one Zarr chunk, or `None` for all cells in one chunk.
+        has_realizations: Whether the provider labels each member of a run with a realization
+            number that changes from run to run, which the archive then stores.
+        notes: Attributes written to the archive's root group, saying what the fields mean.
     """
 
     name: str
@@ -120,6 +139,13 @@ class Product:
     hhl_levels: tuple[int, ...]
     start_delay_hours: float
     deadline_hours: float
+    source: str = "dwd"
+    lookback_hours: float | None = None
+    missing_after_hours: float | None = None
+    live_hours: float | None = None
+    cell_chunk: int | None = None
+    has_realizations: bool = False
+    notes: tuple[tuple[str, str], ...] = ()
 
     @property
     def members(self) -> tuple[int | None, ...]:
@@ -158,6 +184,10 @@ class Product:
     def deadline(self, init_time: datetime) -> datetime:
         """The time after which the recorder commits whatever has arrived for a run."""
         return init_time + timedelta(hours=self.deadline_hours)
+
+    def missing_deadline(self, init_time: datetime) -> datetime:
+        """The time after which a run with no file at all is recorded as `missing`."""
+        return init_time + timedelta(hours=self.missing_after_hours or self.deadline_hours)
 
     def field_by_variable(self, variable: str) -> Field:
         """Look a variable up by its archive name."""
@@ -226,6 +256,7 @@ def expected_files(
                 member=member,
                 step_minutes=step,
             ),
+            init_time=init_time,
         )
         for field in product.fields
         for member in product.members
@@ -279,6 +310,14 @@ def run_init_times(product: Product, *, first: datetime, last: datetime) -> list
     return times
 
 
+_DWD_NOTES: Final[tuple[tuple[str, str], ...]] = (
+    (
+        "shortwave_note",
+        "ASWDIR_S and ASWDIFD_S are averages since the start of the run, as delivered.",
+    ),
+)
+
+
 def _surface_fields(steps: tuple[int, ...], radiation_steps: tuple[int, ...]) -> tuple[Field, ...]:
     """The six fields every DWD product archives: shortwave radiation, wind, temperature, cloud."""
     return (
@@ -312,6 +351,7 @@ ICON_D2_EPS: Final[Product] = Product(
     hhl_levels=(62, 63, 64),
     start_delay_hours=0.5,
     deadline_hours=23.0,
+    notes=_DWD_NOTES,
 )
 
 ICON_D2: Final[Product] = Product(
@@ -326,6 +366,7 @@ ICON_D2: Final[Product] = Product(
     hhl_levels=(62, 63, 64),
     start_delay_hours=0.5,
     deadline_hours=23.0,
+    notes=_DWD_NOTES,
 )
 
 ICON_EU_EPS: Final[Product] = Product(
@@ -340,6 +381,7 @@ ICON_EU_EPS: Final[Product] = Product(
     hhl_levels=(72, 73, 74),
     start_delay_hours=2.0,
     deadline_hours=24.0,
+    notes=_DWD_NOTES,
 )
 
 ICON_ART_EU: Final[Product] = Product(
@@ -359,8 +401,99 @@ ICON_ART_EU: Final[Product] = Product(
     hhl_levels=(),
     start_delay_hours=2.0,
     deadline_hours=24.0,
+    notes=_DWD_NOTES,
+)
+
+# MOGREPS-UK publishes 15-minute lead times to 11 h 45 min and hourly lead times after that, for
+# 9 of the 10 fields we keep, and hourly lead times only for the rest. Shortwave has no lead time 0.
+_MOGREPS_HOURLY: Final[tuple[int, ...]] = _minutes((0, 126 * _H, _H))
+_MOGREPS_HOURLY_FROM_1H: Final[tuple[int, ...]] = _minutes((_H, 126 * _H, _H))
+_MOGREPS_MIXED: Final[tuple[int, ...]] = _minutes((0, 705, 15), (12 * _H, 126 * _H, _H))
+_MOGREPS_FILE: Final[str] = "radiation_flux_in_shortwave_{}_downward_at_surface"
+_MOGREPS_HEIGHT_M: Final[int] = 100
+
+MOGREPS_UK: Final[Product] = Product(
+    name="mogreps-uk",
+    provider="Met Office",
+    licence="CC BY-SA 4.0",
+    cycle_hours=1,
+    n_members=3,
+    fields=(
+        Field(
+            "shortwave_total",
+            _MOGREPS_FILE.format("total"),
+            "surface_downwelling_shortwave_flux_in_air",
+            _MOGREPS_HOURLY_FROM_1H,
+        ),
+        Field(
+            "shortwave_direct",
+            _MOGREPS_FILE.format("direct"),
+            "surface_direct_downwelling_shortwave_flux_in_air",
+            _MOGREPS_HOURLY_FROM_1H,
+        ),
+        Field(
+            "shortwave_diffuse",
+            _MOGREPS_FILE.format("diffuse"),
+            "surface_diffusive_downwelling_shortwave_flux_in_air",
+            _MOGREPS_HOURLY_FROM_1H,
+        ),
+        Field("temperature_1p5m", "temperature_at_screen_level", "air_temperature", _MOGREPS_MIXED),
+        Field("wind_speed_10m", "wind_speed_at_10m", "wind_speed", _MOGREPS_MIXED),
+        Field("wind_direction_10m", "wind_direction_at_10m", "wind_from_direction", _MOGREPS_MIXED),
+        Field("cloud_total", "cloud_amount_of_total_cloud", "cloud_area_fraction", _MOGREPS_HOURLY),
+        Field(
+            "wind_speed_100m",
+            "wind_speed_on_height_levels",
+            "wind_speed",
+            _MOGREPS_HOURLY,
+            _MOGREPS_HEIGHT_M,
+        ),
+        Field(
+            "wind_direction_100m",
+            "wind_direction_on_height_levels",
+            "wind_from_direction",
+            _MOGREPS_HOURLY,
+            _MOGREPS_HEIGHT_M,
+        ),
+    ),
+    hhl_levels=(),
+    # The first file of a run appears about 1 h 44 min after initialisation and the last about
+    # 2 h 38 min after.
+    start_delay_hours=1.75,
+    deadline_hours=24.0,
+    source="mogreps",
+    # The bucket deletes an object 30 days after it was written (rounded up to midnight UTC). A run
+    # with no file is `missing` only one day before its files could no longer be fetched.
+    lookback_hours=30 * 24.0,
+    missing_after_hours=29 * 24.0,
+    live_hours=6.0,
+    cell_chunk=44_000,
+    has_realizations=True,
+    notes=(
+        (
+            "shortwave_note",
+            (
+                "The shortwave files carry no cell_methods and no time bounds, and their time is "
+                "the valid time, so the values are taken to be instantaneous. Stored as delivered."
+            ),
+        ),
+        (
+            "generating_process_note",
+            "The Unified Model version from the file (13.8 is stored as 1308).",
+        ),
+        (
+            "grid_note",
+            (
+                "The cells are the rectangle of the Met Office 2 km Lambert azimuthal equal-area "
+                "grid that contains the crop box, flattened row by row; grid_shape is (rows, "
+                "columns). Members are numbered 1 to 3 in file order; the realization array holds "
+                "the Met Office's number for each, which changes from run to run."
+            ),
+        ),
+    ),
 )
 
 PRODUCTS: Final[dict[str, Product]] = {
-    product.name: product for product in (ICON_D2_EPS, ICON_D2, ICON_EU_EPS, ICON_ART_EU)
+    product.name: product
+    for product in (ICON_D2_EPS, ICON_D2, ICON_EU_EPS, ICON_ART_EU, MOGREPS_UK)
 }

@@ -70,3 +70,41 @@ def test_active_faults_round_trip_and_a_missing_file_means_none(tmp_path: Path) 
     assert cache.load_active_faults() == set()
     cache.save_active_faults({"a", "b"})
     assert cache.load_active_faults() == {"a", "b"}
+
+
+def test_a_grid_keeps_its_rectangle_shape_through_the_cache(tmp_path: Path) -> None:
+    run = _run(tmp_path)
+    grid = RunGrid(
+        n_points=100,
+        cell_index=np.arange(6, dtype=np.int32),
+        statics={"clat": np.zeros(6, np.float32)},
+        shape=(2, 3),
+    )
+    run.save_grid(grid)
+    loaded = run.load_grid()
+    assert loaded is not None
+    assert loaded.shape == (2, 3)
+    run.save_grid(RunGrid(n_points=100, cell_index=grid.cell_index, statics=grid.statics))
+    loaded = run.load_grid()
+    assert loaded is not None
+    assert loaded.shape is None
+
+
+def test_member_ids_round_trip_and_an_unreadable_file_is_dropped(tmp_path: Path) -> None:
+    run = _run(tmp_path)
+    assert run.load_member_ids() is None
+    run.save_member_ids((3, 4, 5))
+    assert run.load_member_ids() == (3, 4, 5)
+    (run.directory / "members.json").write_text("{")
+    assert run.load_member_ids() is None
+    assert not (run.directory / "members.json").exists()
+
+
+def test_a_backoff_round_trips_and_an_unreadable_file_is_dropped(tmp_path: Path) -> None:
+    run = _run(tmp_path)
+    assert run.load_backoff() is None
+    when = datetime(2026, 9, 25, 12, 30, tzinfo=UTC)
+    run.save_backoff(attempts=2, next_try=when)
+    assert run.load_backoff() == (2, when)
+    (run.directory / "backoff.json").write_text("[]")
+    assert run.load_backoff() is None

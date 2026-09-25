@@ -187,6 +187,7 @@ class RunToCommit:
         archived_at: When the run was committed.
         code_version: The version of this package that recorded the run.
         load: Reads one cached file's cropped values, or `None` if it never arrived.
+        member_ids: The provider's numbers for the run's members, where it numbers them per run.
     """
 
     init_time: datetime
@@ -197,6 +198,7 @@ class RunToCommit:
     archived_at: datetime
     code_version: str
     load: Callable[[str, int | None, int], np.ndarray | None]
+    member_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -208,12 +210,14 @@ class StoredGrid:
         cell_index: The indices of the archived cells within the full grid.
         clat: The latitude of the archived cells.
         clon: The longitude of the archived cells.
+        shape: The number of rows and columns of the archived cells, if they form a rectangle.
     """
 
     n_points: int
     cell_index: np.ndarray
     clat: np.ndarray
     clon: np.ndarray
+    shape: tuple[int, int] | None = None
 
 
 class ProductStore:
@@ -263,11 +267,14 @@ class ProductStore:
         group = self._read_group()
         if group is None or "cell" not in group:
             return None
+        grid_shape = group.attrs.get("grid_shape")
+        rows_columns = None if grid_shape is None else np.asarray(grid_shape)
         return StoredGrid(
             n_points=int(group.attrs["n_points"]),  # ty: ignore[invalid-argument-type]
             cell_index=np.asarray(_array(group, "cell")[:]),
             clat=np.asarray(_array(group, "clat")[:]),
             clon=np.asarray(_array(group, "clon")[:]),
+            shape=None if rows_columns is None else (int(rows_columns[0]), int(rows_columns[1])),
         )
 
     def layout_mismatch(self) -> str | None:
@@ -332,11 +339,11 @@ class ProductStore:
                     "Every variable is placed at its own lead times on the shared step axis. "
                     "Lead times a variable does not have are NaN."
                 ),
-                "shortwave_note": (
-                    "ASWDIR_S and ASWDIFD_S are averages since the start of the run, as delivered."
-                ),
+                **dict(product.notes),
             }
         )
+        if grid.shape is not None:
+            group.attrs["grid_shape"] = list(grid.shape)
         codecs: tuple[Any, ...] = (ZstdCodec(level=3), Crc32cCodec())
         time_attrs = {
             "units": "seconds since 1970-01-01 00:00:00",
@@ -361,6 +368,16 @@ class ProductStore:
         along_init_time("archived_at", "int64", time_attrs)
         along_init_time("generating_process", "int32")
         along_init_time("code_version", "str")
+        if product.has_realizations:
+            group.create_array(
+                "realization",
+                shape=(0, len(product.members)),
+                chunks=(_INIT_TIME_CHUNK, len(product.members)),
+                dtype="int32",
+                fill_value=0,
+                dimension_names=("init_time", "member"),
+                attributes={"description": "The provider's number for each member of the run"},
+            )
 
         _write_static(group, "cell", grid.cell_index, dims=("cell",))
         _write_static(
@@ -381,13 +398,14 @@ class ProductStore:
             _write_static(group, name, values.astype(np.float32), dims=("cell",))
 
         for field in product.fields:
+            cells_per_chunk = min(product.cell_chunk or n_cells, n_cells)
             if product.n_members is None:
                 shape: tuple[int, ...] = (0, n_steps, n_cells)
-                chunks: tuple[int, ...] = (1, n_steps, n_cells)
+                chunks: tuple[int, ...] = (1, n_steps, cells_per_chunk)
                 dims: tuple[str, ...] = ("init_time", "step", "cell")
             else:
                 shape = (0, product.n_members, n_steps, n_cells)
-                chunks = (1, 1, n_steps, n_cells)
+                chunks = (1, 1, n_steps, cells_per_chunk)
                 dims = ("init_time", "member", "step", "cell")
             group.create_array(
                 field.variable,
@@ -398,8 +416,8 @@ class ProductStore:
                 dimension_names=dims,
                 compressors=codecs,
                 attributes={
-                    "dwd_parameter": field.parameter,
-                    "model_level": field.level,
+                    f"{product.source}_parameter": field.parameter,
+                    "model_level" if product.source == "dwd" else "height_m": field.level,
                 },
             )
         session.commit(f"Create the {product.name} archive layout", allow_empty=True)
@@ -447,6 +465,8 @@ class ProductStore:
         _array(group, "archived_at")[slot] = int(run.archived_at.timestamp())
         _array(group, "generating_process")[slot] = run.generating_process
         _array(group, "code_version")[slot] = run.code_version
+        if product.has_realizations and run.member_ids:
+            _array(group, "realization")[slot] = np.array(run.member_ids, dtype=np.int32)
         message = (
             f"{product.name} {run.init_time:%Y-%m-%dT%H:%MZ} {STATUS_NAMES[run.status]} "
             f"{run.files_received}/{run.files_expected} files"
@@ -475,6 +495,8 @@ class ProductStore:
             "generating_process",
             "code_version",
         ]
+        if self.product.has_realizations:
+            names.append("realization")
         names.extend(field.variable for field in self.product.fields)
         return names
 

@@ -17,6 +17,7 @@ import httpx
 import icechunk
 
 from nwp_archivist.dwd import Fetcher
+from nwp_archivist.mogreps import MogrepsSource
 from nwp_archivist.products import PRODUCTS
 from nwp_archivist.recorder import DEFAULT_MIN_FREE_BYTES, Recorder, RecorderConfig
 from nwp_archivist.reporting import make_reporter
@@ -31,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Define the command-line arguments."""
     parser = argparse.ArgumentParser(
         prog="archive-record",
-        description="Record one cycle of DWD ensemble weather products.",
+        description="Record one cycle of short-retention ensemble weather products.",
     )
     parser.add_argument(
         "--store-root",
@@ -50,10 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--products",
         nargs="+",
         choices=sorted(PRODUCTS),
-        default=sorted(PRODUCTS),
-        help="The products to record (default: all).",
+        default=sorted(name for name, product in PRODUCTS.items() if product.source == "dwd"),
+        help="The products to record (default: the DWD products).",
     )
     parser.add_argument("--workers", type=int, default=8, help="Files downloaded in parallel.")
+    parser.add_argument(
+        "--backfill-minutes",
+        type=float,
+        default=15.0,
+        help="How long a cycle may spend on runs older than a product's live window.",
+    )
     parser.add_argument(
         "--min-free-gib",
         type=float,
@@ -94,6 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cache_dir=Path(args.cache_dir),
         min_free_bytes=int(args.min_free_gib * 1024**3),
         workers=args.workers,
+        backfill_seconds=args.backfill_minutes * 60,
     )
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -109,8 +117,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         limits = httpx.Limits(max_connections=args.workers, max_keepalive_connections=args.workers)
         with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, limits=limits) as client:
+            fetcher = Fetcher(client=client)
             recorder = Recorder(
-                config=config, fetcher=Fetcher(client=client), reporter=make_reporter()
+                config=config,
+                fetcher=fetcher,
+                reporter=make_reporter(),
+                mogreps_source=MogrepsSource(fetcher=fetcher),
             )
             recorder.run_cycle([PRODUCTS[name] for name in args.products])
     return 0

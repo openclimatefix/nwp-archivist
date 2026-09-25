@@ -39,13 +39,15 @@ def test_without_a_store_root_the_command_exits_with_2() -> None:
     assert _StubRecorder.instances == []
 
 
-def test_the_store_root_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_store_root_comes_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setenv("ARCHIVE_STORE_ROOT", "s3://bucket/prefix")
-    assert cli.main([]) == 0
+    assert cli.main(["--cache-dir", str(tmp_path)]) == 0
     assert _StubRecorder.instances[0].config.store.root == "s3://bucket/prefix"
 
 
-def test_the_flags_reach_the_recorder_and_all_products_run_by_default(tmp_path: Path) -> None:
+def test_the_flags_reach_the_recorder_and_the_dwd_products_run_by_default(tmp_path: Path) -> None:
     code = cli.main(
         ["--store-root", str(tmp_path / "s"), "--cache-dir", str(tmp_path / "c"), "--workers", "3"]
     )
@@ -53,12 +55,35 @@ def test_the_flags_reach_the_recorder_and_all_products_run_by_default(tmp_path: 
     recorder = _StubRecorder.instances[0]
     assert recorder.config.cache_dir == tmp_path / "c"
     assert recorder.config.workers == 3
-    assert {p.name for p in recorder.products} == set(PRODUCTS)
+    assert {p.name for p in recorder.products} == {
+        name for name, product in PRODUCTS.items() if product.source == "dwd"
+    }
+    assert "mogreps-uk" not in {p.name for p in recorder.products}
 
 
 def test_the_products_flag_selects_products(tmp_path: Path) -> None:
-    cli.main(["--store-root", str(tmp_path), "--products", "icon-d2"])
+    cli.main(
+        ["--store-root", str(tmp_path), "--cache-dir", str(tmp_path / "c"), "--products", "icon-d2"]
+    )
     assert [p.name for p in _StubRecorder.instances[0].products] == ["icon-d2"]
+
+
+def test_mogreps_is_recorded_when_asked_for_and_gets_its_backfill_budget(tmp_path: Path) -> None:
+    cli.main(
+        [
+            "--store-root",
+            str(tmp_path),
+            "--cache-dir",
+            str(tmp_path / "c"),
+            "--products",
+            "mogreps-uk",
+            "--backfill-minutes",
+            "7",
+        ]
+    )
+    recorder = _StubRecorder.instances[0]
+    assert [p.name for p in recorder.products] == ["mogreps-uk"]
+    assert recorder.config.backfill_seconds == 7 * 60
 
 
 def test_the_default_cache_directory_is_on_the_data_disk() -> None:

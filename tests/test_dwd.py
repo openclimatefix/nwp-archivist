@@ -160,3 +160,35 @@ def test_the_rate_limit_spaces_requests() -> None:
     # The fake sleep returns at once, so each wait is measured from the same start.
     assert 0.4 < sleeps[0] <= 0.5
     assert 0.9 < sleeps[1] <= 1.0
+
+
+def test_a_range_request_returns_the_bytes_and_the_size_of_the_whole_file() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["range"])
+        return httpx.Response(206, content=b"abc", headers={"Content-Range": "bytes 10-12/500"})
+
+    assert _fetcher(handler).get_range(URL, start=10, stop=13) == (b"abc", 500)
+    assert seen == ["bytes=10-12"]
+
+
+def test_a_range_response_without_a_total_size_is_not_yet() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(206, content=b"abc")
+
+    assert isinstance(_fetcher(handler).get_range(URL, start=0, stop=3), NotYet)
+
+
+def test_a_range_request_is_retried_like_a_whole_file_request() -> None:
+    responses = [
+        httpx.Response(503),
+        httpx.Response(206, content=b"abc", headers={"Content-Range": "bytes 0-2/3"}),
+    ]
+    assert _fetcher(lambda _request: responses.pop(0)).get_range(URL, start=0, stop=3) == (
+        b"abc",
+        3,
+    )
+    assert _fetcher(lambda _request: httpx.Response(404)).get_range(URL, start=0, stop=3) == (
+        NotYet("404")
+    )

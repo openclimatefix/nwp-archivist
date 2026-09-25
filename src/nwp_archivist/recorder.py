@@ -9,6 +9,7 @@ the others.
 import logging
 import shutil
 import subprocess
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -20,16 +21,10 @@ from typing import Final
 import numpy as np
 
 from nwp_archivist.cache import ProductCache, RunCache, RunGrid
-from nwp_archivist.dwd import Decoded, Expectation, Fetcher, NotYet
-from nwp_archivist.products import (
-    DWD_BASE_URL,
-    ExpectedFile,
-    Product,
-    expected_files,
-    run_init_times,
-    static_urls,
-)
+from nwp_archivist.dwd import DwdSource, Fetcher
+from nwp_archivist.products import DWD_BASE_URL, ExpectedFile, Product, run_init_times
 from nwp_archivist.reporting import FaultType, Reporter
+from nwp_archivist.source import NotYet, Source
 from nwp_archivist.store import (
     STATUS_COMPLETE,
     STATUS_MISSING,
@@ -38,7 +33,6 @@ from nwp_archivist.store import (
     ProductStore,
     RunToCommit,
     StoreLocation,
-    box_cell_index,
     slot_for,
 )
 
@@ -59,6 +53,11 @@ EXHAUSTIVE_AFTER_START_HOURS: Final[float] = 3.0
 DEADLINE_RETRY_PASSES: Final[int] = 2
 
 _GIT_TIMEOUT_SECONDS: Final[float] = 5.0
+
+# A run that no pass found any file of is looked at again after this delay, which doubles with each
+# empty pass up to the cap, so that a run the provider never published costs a few requests a day.
+BACKOFF_FIRST: Final[timedelta] = timedelta(minutes=30)
+BACKOFF_CAP: Final[timedelta] = timedelta(hours=12)
 
 
 class GridChangedError(Exception):
@@ -102,7 +101,12 @@ class RecorderConfig:
         lookback_hours: How far back from now a cycle looks for runs that are not yet archived.
             Runs that still have a cache directory are always examined as well.
         workers: The number of files downloaded in parallel.
-        base_url: The root of the provider's directory layout.
+        base_url: The root of DWD's directory layout.
+        backfill_seconds: How long a cycle may spend on runs that are not live (see
+            `Product.live_hours`) once its live runs are done. A run in progress when the time is
+            up stops at its next file.
+        backfill_workers: The number of files downloaded in parallel for a run that is not live,
+            which keeps the backfill's request rate modest.
     """
 
     store: StoreLocation
@@ -111,6 +115,8 @@ class RecorderConfig:
     lookback_hours: float = DEFAULT_LOOKBACK_HOURS
     workers: int = 8
     base_url: str = DWD_BASE_URL
+    backfill_seconds: float = 15 * 60.0
+    backfill_workers: int = 2
 
 
 @dataclass
@@ -121,6 +127,7 @@ class _FetchPassResult:
     grid_changed: str | None = None
     n_fetched: int = 0
     transient: bool = False
+    member_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -129,6 +136,7 @@ class _RunOutcome:
 
     clean: bool
     n_fetched: int = 0
+    empty: bool = False
 
 
 def _utc_now() -> datetime:
@@ -178,19 +186,25 @@ class Recorder:
         fetcher: Fetcher,
         reporter: Reporter,
         clock: Callable[[], datetime] = _utc_now,
+        mogreps_source: Source | None = None,
     ) -> None:
         """Build a recorder.
 
         Args:
             config: The recorder's settings.
-            fetcher: The file downloader.
+            fetcher: The DWD file downloader.
             reporter: Where faults and the cycle check-in go.
             clock: Returns the current time, replaceable so that tests control time.
+            mogreps_source: Reads MOGREPS-UK files, if that product is recorded.
         """
         self.config = config
-        self.fetcher = fetcher
         self.reporter = reporter
         self.clock = clock
+        self._sources: dict[str, Source] = {
+            "dwd": DwdSource(fetcher=fetcher, base_url=config.base_url)
+        }
+        if mogreps_source is not None:
+            self._sources["mogreps"] = mogreps_source
         self._code_version = code_version()
 
     def run_cycle(self, products: Sequence[Product]) -> bool:
@@ -240,14 +254,28 @@ class Recorder:
         clean = self._check_free_space(product=product, ledger=ledger)
         window = run_init_times(
             product,
-            first=now - timedelta(hours=self.config.lookback_hours),
+            first=now - timedelta(hours=product.lookback_hours or self.config.lookback_hours),
             last=now - timedelta(hours=product.start_delay_hours),
         )
+        runs = sorted({*window, *cache.cached_runs()})
+        live_runs = [
+            run
+            for run in runs
+            if product.live_hours is None or now - run <= timedelta(hours=product.live_hours)
+        ]
+        # A backfill starts with the newest run, because the provider deletes the oldest first.
+        backfill_runs = sorted(set(runs) - set(live_runs), reverse=True)
+        backfill_end = time.monotonic() + self.config.backfill_seconds
         oldest_fetched: datetime | None = None
-        for init_time in sorted({*window, *cache.cached_runs()}):
+        for init_time in (*live_runs, *backfill_runs):
+            backfill = init_time not in live_runs
+            if backfill and time.monotonic() >= backfill_end:
+                break
             if _slot_archived(product, archived, init_time) or cache.is_done(init_time):
                 # A commit can land without its cleanup, so a leftover cache is deleted here.
                 cache.run(init_time).delete()
+                continue
+            if self._backing_off(cache.run(init_time), now=now):
                 continue
             try:
                 outcome = self._process_run(
@@ -257,6 +285,7 @@ class Recorder:
                     ledger=ledger,
                     init_time=init_time,
                     now=now,
+                    stop=(lambda: time.monotonic() >= backfill_end) if backfill else None,
                 )
             except Exception as error:
                 logger.warning(
@@ -271,6 +300,8 @@ class Recorder:
                 clean = False
                 continue
             clean &= outcome.clean
+            if outcome.empty and product.missing_after_hours is not None:
+                self._record_empty_pass(cache.run(init_time), now=now)
             if outcome.n_fetched and oldest_fetched is None:
                 oldest_fetched = init_time
         if oldest_fetched is not None:
@@ -282,6 +313,21 @@ class Recorder:
                 (now - oldest_fetched).total_seconds() / 3600,
             )
         return clean
+
+    @staticmethod
+    def _backing_off(run_cache: RunCache, *, now: datetime) -> bool:
+        """Whether an earlier empty pass put this run off until later."""
+        backoff = run_cache.load_backoff()
+        return backoff is not None and now < backoff[1]
+
+    @staticmethod
+    def _record_empty_pass(run_cache: RunCache, *, now: datetime) -> None:
+        """Delay the next look at a run with no files, doubling the delay each time."""
+        backoff = run_cache.load_backoff()
+        attempts = 0 if backoff is None else backoff[0]
+        run_cache.save_backoff(
+            attempts=attempts + 1, next_try=now + min(BACKOFF_FIRST * 2**attempts, BACKOFF_CAP)
+        )
 
     def _halt(
         self,
@@ -311,6 +357,7 @@ class Recorder:
         ledger: _FaultLedger,
         init_time: datetime,
         now: datetime,
+        stop: Callable[[], bool] | None = None,
     ) -> _RunOutcome:
         """Fetch what is missing of one run and commit it if it is complete or past its deadline.
 
@@ -321,23 +368,28 @@ class Recorder:
             ledger: Where persistent faults are reported.
             init_time: The run's initialisation time.
             now: The time this cycle started.
+            stop: Says when the fetch pass should give up on the rest of the run, or `None`.
 
         Returns:
-            Whether the run was handled without a fault, and how many files were downloaded.
+            Whether the run was handled without a fault, how many files were downloaded, and
+            whether the run is still waiting with none of its files.
         """
-        files = expected_files(product, init_time, base_url=self.config.base_url)
+        source = self._sources[product.source]
+        files = source.expected_files(product, init_time)
         run_cache = cache.run(init_time)
         past_deadline = now >= product.deadline(init_time)
+        past_missing = now >= product.missing_deadline(init_time)
         exhaustive = now >= init_time + timedelta(
             hours=product.start_delay_hours + EXHAUSTIVE_AFTER_START_HOURS
         )
         grid, mismatch = self._ensure_grid(
+            source=source,
             product=product,
             store=store,
             run_cache=run_cache,
             ledger=ledger,
             init_time=init_time,
-            past_deadline=past_deadline,
+            past_deadline=past_missing,
         )
         # A halted product keeps fetching, so that no run is lost while a person decides what to do.
         # Once a run is past its deadline nothing more will arrive, so it is left alone.
@@ -345,33 +397,29 @@ class Recorder:
         n_fetched = 0
         received = 0
         if grid is not None:
-            n_cells = len(grid.cell_index)
             if not (halted and past_deadline):
-                passes = 1 + (DEADLINE_RETRY_PASSES if past_deadline else 0)
-                for _ in range(passes):
-                    result = self._fetch_pass(
-                        files=files, grid=grid, run_cache=run_cache, exhaustive=exhaustive
-                    )
-                    n_fetched += result.n_fetched
-                    mismatch = mismatch or result.grid_changed
-                    if (
-                        result.generating_process is not None
-                        and run_cache.load_generating_process() is None
-                    ):
-                        run_cache.save_generating_process(result.generating_process)
-                    received = run_cache.count_received(files, n_cells=n_cells)
-                    if received == len(files) or not result.transient:
-                        break
-            received = run_cache.count_received(files, n_cells=n_cells)
+                n_fetched, changed = self._fetch_run(
+                    source=source,
+                    files=files,
+                    grid=grid,
+                    run_cache=run_cache,
+                    exhaustive=exhaustive,
+                    past_deadline=past_deadline,
+                    stop=stop,
+                )
+                mismatch = mismatch or changed
+            received = run_cache.count_received(files, n_cells=len(grid.cell_index))
         if mismatch is not None:
             self._halt(cache=cache, product=product, reason=mismatch, init_time=init_time)
         if received == len(files):
             status = STATUS_COMPLETE
-        elif past_deadline:
-            status = STATUS_PARTIAL if received > 0 else STATUS_MISSING
+        elif received > 0 and past_deadline:
+            status = STATUS_PARTIAL
+        elif received == 0 and past_missing:
+            status = STATUS_MISSING
         else:
             self._log_run(product, init_time, len(files), received, "waiting")
-            return _RunOutcome(clean=True, n_fetched=n_fetched)
+            return _RunOutcome(clean=True, n_fetched=n_fetched, empty=received == 0)
         if cache.halted() is not None:
             self._log_run(product, init_time, len(files), received, "halted")
             return _RunOutcome(clean=False, n_fetched=n_fetched)
@@ -423,6 +471,7 @@ class Recorder:
                     files_expected=n_files,
                     files_received=received,
                     generating_process=run_cache.load_generating_process() or 0,
+                    member_ids=run_cache.load_member_ids() or (),
                     archived_at=self.clock(),
                     code_version=self._code_version,
                     load=lambda variable, member, step: run_cache.load(
@@ -483,6 +532,7 @@ class Recorder:
     def _ensure_grid(
         self,
         *,
+        source: Source,
         product: Product,
         store: ProductStore,
         run_cache: RunCache,
@@ -497,12 +547,13 @@ class Recorder:
         differs from the archive's keeps its own grid, so that its files are still fetched.
 
         Args:
+            source: The provider's files.
             product: The product being recorded.
             store: The product's repository.
             run_cache: The run's local cache.
             ledger: Where persistent faults are reported.
             init_time: The run's initialisation time.
-            past_deadline: Whether the run's deadline has passed.
+            past_deadline: Whether the time has passed after which a run with no file is missing.
 
         Returns:
             The grid, or `None` if the files that give it are not published yet, and a description
@@ -511,11 +562,14 @@ class Recorder:
         stored = store.stored_grid()
         wanted = {"clat", "clon"} if stored is not None else None
         grid = run_cache.load_grid()
-        if grid is None or (wanted is None and not self._has_all_statics(product, grid)):
-            grid = self._fetch_grid(
+        if grid is None or (
+            wanted is None and not source.static_names(product) <= grid.statics.keys()
+        ):
+            fetched = source.fetch_grid(
                 product=product, init_time=init_time, only=wanted, previous=grid
             )
-            if grid is not None:
+            if not isinstance(fetched, NotYet):
+                grid = fetched
                 run_cache.save_grid(grid)
         if grid is not None:
             return grid, store.grid_mismatch(grid)
@@ -531,73 +585,93 @@ class Recorder:
                     n_points=stored.n_points,
                     cell_index=stored.cell_index,
                     statics={"clat": stored.clat, "clon": stored.clon},
+                    shape=stored.shape,
                 ),
                 None,
             )
         return None, None
 
-    @staticmethod
-    def _has_all_statics(product: Product, grid: RunGrid) -> bool:
-        needed = {"clat", "clon", "hsurf", "fr_land"} | {f"hhl_L{n}" for n in product.hhl_levels}
-        return needed <= grid.statics.keys()
-
-    def _fetch_grid(
+    def _fetch_run(
         self,
         *,
-        product: Product,
-        init_time: datetime,
-        only: set[str] | None,
-        previous: RunGrid | None,
-    ) -> RunGrid | None:
-        """Download the static fields and crop them, or return `None` if any is not yet there."""
-        urls = static_urls(product, init_time, base_url=self.config.base_url)
-        wanted = {name: url for name, url in urls.items() if only is None or name in only}
-        decoded: dict[str, Decoded] = {}
-        for name, url in wanted.items():
-            level = int(name.removeprefix("hhl_L")) if name.startswith("hhl_L") else None
-            outcome = self.fetcher.fetch(url, expect=Expectation(level=level))
-            if isinstance(outcome, NotYet):
-                logger.info("static %s of %s: %s", name, init_time.isoformat(), outcome.reason)
-                return None
-            decoded[name] = outcome
-        clat = decoded["clat"].values
-        clon = decoded["clon"].values
-        cell_index = box_cell_index(clat=clat, clon=clon)
-        statics = {name: values.values[cell_index] for name, values in decoded.items()}
-        if previous is not None:
-            statics = {**previous.statics, **statics}
-        return RunGrid(n_points=len(clat), cell_index=cell_index, statics=statics)
-
-    def _fetch_pass(
-        self,
-        *,
+        source: Source,
         files: list[ExpectedFile],
         grid: RunGrid,
         run_cache: RunCache,
         exhaustive: bool,
+        past_deadline: bool,
+        stop: Callable[[], bool] | None,
+    ) -> tuple[int, str | None]:
+        """Fetch a run's files, repeating the pass at the deadline if a pass saw a transient error.
+
+        Args:
+            source: The provider's files.
+            files: The files the run should contain.
+            grid: The run's cropped grid.
+            run_cache: The run's local cache.
+            exhaustive: Whether to try every missing file rather than stopping a sequence at its
+                first file that is not yet published.
+            past_deadline: Whether the run's deadline has passed.
+            stop: Says when to give up on the rest of the run, or `None`.
+
+        Returns:
+            How many files were downloaded, and how the grid differs from the archive's, if it does.
+        """
+        n_fetched = 0
+        grid_changed: str | None = None
+        for _ in range(1 + (DEADLINE_RETRY_PASSES if past_deadline else 0)):
+            result = self._fetch_pass(
+                source=source,
+                files=files,
+                grid=grid,
+                run_cache=run_cache,
+                exhaustive=exhaustive,
+                workers=self.config.backfill_workers if stop else self.config.workers,
+                stop=stop,
+            )
+            n_fetched += result.n_fetched
+            grid_changed = grid_changed or result.grid_changed
+            if (
+                result.generating_process is not None
+                and run_cache.load_generating_process() is None
+            ):
+                run_cache.save_generating_process(result.generating_process)
+            if result.member_ids and run_cache.load_member_ids() is None:
+                run_cache.save_member_ids(result.member_ids)
+            received = run_cache.count_received(files, n_cells=len(grid.cell_index))
+            if received == len(files) or not result.transient:
+                break
+        return n_fetched, grid_changed
+
+    def _fetch_pass(
+        self,
+        *,
+        source: Source,
+        files: list[ExpectedFile],
+        grid: RunGrid,
+        run_cache: RunCache,
+        exhaustive: bool,
+        workers: int,
+        stop: Callable[[], bool] | None,
     ) -> _FetchPassResult:
         """Make one pass over the run's files, caching each one that has arrived.
 
-        Files appear in step order, so unless `exhaustive` a sequence (one variable of one member)
+        Files appear in step order, so unless `exhaustive` a sequence (as the source defines it)
         stops at its first file that is not yet published.
         """
-        sequences: dict[tuple[str, int | None], list[ExpectedFile]] = {}
+        sequences: dict[tuple[str, ...], list[ExpectedFile]] = {}
         for file in files:
-            sequences.setdefault((file.field.variable, file.member), []).append(file)
+            sequences.setdefault(source.sequence_key(file), []).append(file)
         n_cells = len(grid.cell_index)
 
         def fetch_sequence(sequence: list[ExpectedFile]) -> _FetchPassResult:
             partial = _FetchPassResult()
             for file in sequence:
+                if stop is not None and stop():
+                    break
                 if run_cache.has(file, n_cells=n_cells):
                     continue
-                expect = Expectation(
-                    short_name=file.field.short_name,
-                    step_minutes=file.step_minutes,
-                    member=file.member,
-                    level=file.field.level,
-                )
-                outcome = self.fetcher.fetch(file.url, expect=expect)
+                outcome = source.fetch(file, grid)
                 if isinstance(outcome, NotYet):
                     if outcome.reason != "404":
                         partial.transient = True
@@ -605,23 +679,25 @@ class Recorder:
                     if exhaustive:
                         continue
                     break
-                if len(outcome.values) != grid.n_points:
+                if outcome.n_points != grid.n_points:
                     partial.grid_changed = (
-                        f"a file has {len(outcome.values)} cells, the archive's grid has "
+                        f"a file has {outcome.n_points} cells, the archive's grid has "
                         f"{grid.n_points}"
                     )
                     continue
-                run_cache.save(file, outcome.values[grid.cell_index])
+                run_cache.save(file, outcome.values)
                 partial.n_fetched += 1
                 partial.generating_process = outcome.generating_process
+                partial.member_ids = outcome.member_ids
             return partial
 
         result = _FetchPassResult()
-        with ThreadPoolExecutor(max_workers=self.config.workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             for partial in pool.map(fetch_sequence, sequences.values()):
                 result.grid_changed = result.grid_changed or partial.grid_changed
                 result.n_fetched += partial.n_fetched
                 result.transient |= partial.transient
                 if partial.generating_process is not None:
                     result.generating_process = partial.generating_process
+                result.member_ids = partial.member_ids or result.member_ids
         return result

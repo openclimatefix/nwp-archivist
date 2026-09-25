@@ -5,16 +5,25 @@ the caller leaves it unrecorded and asks again on the next cycle. Nothing here r
 provider misbehaving.
 """
 
+import logging
 import random
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 
 import eccodes
 import httpx
 import numpy as np
+
+from nwp_archivist.cache import RunGrid
+from nwp_archivist.products import ExpectedFile, Product, expected_files, static_urls
+from nwp_archivist.source import Cropped, NotYet
+from nwp_archivist.store import box_cell_index
+
+logger = logging.getLogger(__name__)
 
 # ecCodes documents its handles as safe to use from separate threads only in some builds, so
 # decoding is serialised. A decode takes about 15 ms, whereas a download takes far longer, so
@@ -22,17 +31,6 @@ import numpy as np
 _ECCODES_LOCK: Final[threading.Lock] = threading.Lock()
 
 RETRY_STATUS_CODES: Final[frozenset[int]] = frozenset({408, 425, 429, 500, 502, 503, 504})
-
-
-@dataclass(frozen=True)
-class NotYet:
-    """The outcome of a fetch that produced no usable file.
-
-    Attributes:
-        reason: A short description of what was wrong, for the log.
-    """
-
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -158,6 +156,41 @@ class Fetcher:
         if start > now:
             self.sleep(start - now)
 
+    def _request(self, url: str, headers: dict[str, str] | None = None) -> httpx.Response | NotYet:
+        """Send a GET request, retrying transient failures.
+
+        Args:
+            url: The address of the file.
+            headers: Extra request headers, such as `Range`, or `None`.
+
+        Returns:
+            The response (status 200 or 206), or `NotYet` when the file is absent (404), a
+            retryable error persists, or the body is shorter than its `Content-Length` header says.
+        """
+        reason = "no attempt made"
+        for attempt in range(self.max_attempts):
+            if attempt > 0:
+                self.sleep(self.backoff_seconds * 2 ** (attempt - 1) * (1 + self.jitter()))
+            self._wait_for_rate_limit()
+            try:
+                response = self.client.get(url, headers=headers)
+            except httpx.TransportError as error:
+                reason = f"transport error: {type(error).__name__}"
+                continue
+            if response.status_code == httpx.codes.NOT_FOUND:
+                return NotYet("404")
+            if response.status_code in RETRY_STATUS_CODES:
+                reason = f"http {response.status_code}"
+                continue
+            if response.status_code not in {httpx.codes.OK, httpx.codes.PARTIAL_CONTENT}:
+                return NotYet(f"http {response.status_code}")
+            declared = response.headers.get("content-length")
+            if declared is not None and int(declared) != len(response.content):
+                reason = f"short body: {len(response.content)} of {declared} bytes"
+                continue
+            return response
+        return NotYet(reason)
+
     def get(self, url: str) -> bytes | NotYet:
         """Download one file, retrying transient failures.
 
@@ -168,29 +201,29 @@ class Fetcher:
             The body, or `NotYet` when the file is absent (404), a retryable error persists, or
             the body is shorter than its `Content-Length` header says.
         """
-        reason = "no attempt made"
-        for attempt in range(self.max_attempts):
-            if attempt > 0:
-                self.sleep(self.backoff_seconds * 2 ** (attempt - 1) * (1 + self.jitter()))
-            self._wait_for_rate_limit()
-            try:
-                response = self.client.get(url)
-            except httpx.TransportError as error:
-                reason = f"transport error: {type(error).__name__}"
-                continue
-            if response.status_code == httpx.codes.NOT_FOUND:
-                return NotYet("404")
-            if response.status_code in RETRY_STATUS_CODES:
-                reason = f"http {response.status_code}"
-                continue
-            if response.status_code != httpx.codes.OK:
-                return NotYet(f"http {response.status_code}")
-            declared = response.headers.get("content-length")
-            if declared is not None and int(declared) != len(response.content):
-                reason = f"short body: {len(response.content)} of {declared} bytes"
-                continue
-            return response.content
-        return NotYet(reason)
+        response = self._request(url)
+        return response if isinstance(response, NotYet) else response.content
+
+    def get_range(self, url: str, *, start: int, stop: int) -> tuple[bytes, int] | NotYet:
+        """Download the bytes `[start, stop)` of one file, retrying transient failures.
+
+        Args:
+            url: The address of the file.
+            start: The first byte wanted.
+            stop: One past the last byte wanted.
+
+        Returns:
+            The bytes (fewer than requested if the file ends first) and the size of the whole
+            file, or `NotYet` when the file is absent, unreadable, or the response does not say
+            how large the file is.
+        """
+        response = self._request(url, {"Range": f"bytes={start}-{stop - 1}"})
+        if isinstance(response, NotYet):
+            return response
+        total = response.headers.get("content-range", "").rpartition("/")[2]
+        if not total.isdigit():
+            return NotYet("the response has no Content-Range")
+        return response.content, int(total)
 
     def fetch(self, url: str, *, expect: Expectation) -> Decoded | NotYet:
         """Download and decode one file.
@@ -212,3 +245,74 @@ class Fetcher:
             return NotYet(f"mismatched file: {error}")
         except eccodes.CodesInternalError as error:
             return NotYet(f"undecodable: {error}")
+
+
+@dataclass(frozen=True)
+class DwdSource:
+    """The DWD open-data server: one GRIB2 file per variable, member, and lead time.
+
+    Attributes:
+        fetcher: Downloads and decodes the files.
+        base_url: The root of DWD's directory layout, replaceable so that tests can point elsewhere.
+    """
+
+    fetcher: Fetcher
+    base_url: str
+
+    def expected_files(self, product: Product, init_time: datetime) -> list[ExpectedFile]:
+        """Every file a run should contain."""
+        return expected_files(product, init_time, base_url=self.base_url)
+
+    def sequence_key(self, file: ExpectedFile) -> tuple[str, ...]:
+        """One variable of one member is a sequence."""
+        return (file.field.variable, str(file.member))
+
+    def static_names(self, product: Product) -> set[str]:
+        """The grid fields the archive stores once."""
+        return {"clat", "clon", "hsurf", "fr_land"} | {f"hhl_L{n}" for n in product.hhl_levels}
+
+    def fetch_grid(
+        self,
+        *,
+        product: Product,
+        init_time: datetime,
+        only: set[str] | None,
+        previous: RunGrid | None,
+    ) -> RunGrid | NotYet:
+        """Download the static fields and crop them, or return `NotYet` if any is not yet there."""
+        urls = static_urls(product, init_time, base_url=self.base_url)
+        wanted = {name: url for name, url in urls.items() if only is None or name in only}
+        decoded: dict[str, Decoded] = {}
+        for name, url in wanted.items():
+            level = int(name.removeprefix("hhl_L")) if name.startswith("hhl_L") else None
+            outcome = self.fetcher.fetch(url, expect=Expectation(level=level))
+            if isinstance(outcome, NotYet):
+                logger.info("static %s of %s: %s", name, init_time.isoformat(), outcome.reason)
+                return outcome
+            decoded[name] = outcome
+        clat = decoded["clat"].values
+        clon = decoded["clon"].values
+        cell_index = box_cell_index(clat=clat, clon=clon)
+        statics = {name: values.values[cell_index] for name, values in decoded.items()}
+        if previous is not None:
+            statics = {**previous.statics, **statics}
+        return RunGrid(n_points=len(clat), cell_index=cell_index, statics=statics)
+
+    def fetch(self, file: ExpectedFile, grid: RunGrid) -> Cropped | NotYet:
+        """Download, check, and crop one file."""
+        expect = Expectation(
+            short_name=file.field.short_name,
+            step_minutes=file.step_minutes,
+            member=file.member,
+            level=file.field.level,
+        )
+        outcome = self.fetcher.fetch(file.url, expect=expect)
+        if isinstance(outcome, NotYet):
+            return outcome
+        return Cropped(
+            values=outcome.values[grid.cell_index]
+            if len(outcome.values) == grid.n_points
+            else outcome.values,
+            n_points=len(outcome.values),
+            generating_process=outcome.generating_process,
+        )
