@@ -14,6 +14,8 @@ EnvironmentFile=-%h/.config/nwp-archive.env
 # A cycle handles the live runs first and then spends at most --backfill-minutes on older runs
 # that are still in the bucket (which keeps a run for about 30 days). Two workers download files
 # for the older runs, so that the backfill's request rate stays modest.
-ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 15
+ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 50
+# The timer does not start a second cycle while one runs, and the cache directory's lock stops any
+# other cycle too, so a long backfill only delays the next live pass.
 TimeoutStartSec=infinity
 Nice=10

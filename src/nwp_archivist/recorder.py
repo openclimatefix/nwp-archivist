@@ -265,11 +265,14 @@ class Recorder:
         ]
         # A backfill starts with the newest run, because the provider deletes the oldest first.
         backfill_runs = sorted(set(runs) - set(live_runs), reverse=True)
-        backfill_end = time.monotonic() + self.config.backfill_seconds
+        backfill_end: float | None = None
         oldest_fetched: datetime | None = None
         for init_time in (*live_runs, *backfill_runs):
             backfill = init_time not in live_runs
-            if backfill and time.monotonic() >= backfill_end:
+            if backfill and backfill_end is None:
+                # The budget covers the backfill only, so its clock starts after the live runs.
+                backfill_end = time.monotonic() + self.config.backfill_seconds
+            if backfill_end is not None and backfill and time.monotonic() >= backfill_end:
                 break
             if _slot_archived(product, archived, init_time) or cache.is_done(init_time):
                 # A commit can land without its cleanup, so a leftover cache is deleted here.
@@ -285,7 +288,9 @@ class Recorder:
                     ledger=ledger,
                     init_time=init_time,
                     now=now,
-                    stop=(lambda: time.monotonic() >= backfill_end) if backfill else None,
+                    stop=(lambda end=backfill_end: time.monotonic() >= end)
+                    if backfill_end
+                    else None,
                 )
             except Exception as error:
                 logger.warning(
@@ -413,6 +418,11 @@ class Recorder:
             self._halt(cache=cache, product=product, reason=mismatch, init_time=init_time)
         if received == len(files):
             status = STATUS_COMPLETE
+        elif stop is not None and stop():
+            # The backfill's time budget ended mid-run. The rest of the files are still in the
+            # bucket, so the run waits for the next cycle instead of committing partial.
+            self._log_run(product, init_time, len(files), received, "waiting")
+            return _RunOutcome(clean=True, n_fetched=n_fetched)
         elif received > 0 and past_deadline:
             status = STATUS_PARTIAL
         elif received == 0 and past_missing:

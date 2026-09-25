@@ -30,6 +30,7 @@ from support_mogreps import (
 )
 
 from nwp_archivist import mogreps as mogreps_module
+from nwp_archivist import recorder as recorder_module
 from nwp_archivist.cache import ProductCache
 from nwp_archivist.dwd import Fetcher
 from nwp_archivist.mogreps import LambertAzimuthalEqualArea, MogrepsSource, box_rectangle
@@ -476,3 +477,58 @@ def test_a_file_that_lands_late_is_still_fetched_before_the_deadline(tmp_path: P
     clock.advance(timedelta(minutes=30))
     recorder.run_cycle([TINY_MOGREPS])
     assert _status(tmp_path) == STATUS_COMPLETE
+
+
+def test_a_budget_that_ends_mid_run_leaves_an_old_run_waiting_and_resumes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = hours_after(INIT, -30)  # older than the 24 h partial deadline
+    bucket = FakeBucket(published=lambda file: file.init_time in {old, INIT})
+    recorder, reporter = build_mogreps_recorder(
+        tmp_path,
+        bucket,
+        Clock(SOON),
+        lookback_hours=36.0,
+        backfill_seconds=10.0,
+    )
+    real = recorder.__class__._fetch_pass
+    now = {"seconds": 0.0}
+
+    def expire_after_five_files(self: object, **kwargs: object) -> object:
+        # The budget runs out once eight files of the run have been tried.
+        calls = {"n": 0}
+
+        def stop() -> bool:
+            calls["n"] += 1
+            if calls["n"] > 8:
+                now["seconds"] = 100.0
+            return now["seconds"] > 10.0
+
+        if kwargs["stop"] is not None:
+            kwargs["stop"] = stop
+        return real(self, **kwargs)  # ty: ignore[invalid-argument-type]
+
+    monkeypatch.setattr(recorder.__class__, "_fetch_pass", expire_after_five_files)
+    monkeypatch.setattr(recorder_module.time, "monotonic", lambda: now["seconds"])
+    recorder.run_cycle([TINY_MOGREPS])
+    assert _status(tmp_path, old) == 0
+    assert "partial" not in _faults(reporter)
+    assert ProductCache(root=tmp_path / "cache", product=TINY_MOGREPS.name).cached_runs()
+    # Next cycle, with no budget pressure, finishes the run as complete.
+    monkeypatch.setattr(recorder.__class__, "_fetch_pass", real)
+    now["seconds"] = 0.0
+    recorder.run_cycle([TINY_MOGREPS])
+    assert _status(tmp_path, old) == STATUS_COMPLETE
+    assert "partial" not in _faults(reporter)
+
+
+def test_the_backfill_of_runs_older_than_the_deadline_goes_newest_first(tmp_path: Path) -> None:
+    older = [hours_after(INIT, -offset) for offset in (26, 30, 34)]
+    bucket = FakeBucket()
+    recorder, _ = build_mogreps_recorder(
+        tmp_path, bucket, Clock(SOON), lookback_hours=40.0, backfill_seconds=3600.0
+    )
+    recorder.run_cycle([TINY_MOGREPS])
+    firsts = [bucket.requests.index(bucket.urls_of_run(init)[0]) for init in older]
+    assert firsts == sorted(firsts)
+    assert all(_status(tmp_path, init) == STATUS_COMPLETE for init in older)
