@@ -26,6 +26,7 @@ dev = [
     "boto3>=1.43.102",
     "moto[server]>=5.2.3",
     "pre-commit>=4.6.2",
+    "pymarkdownlnt>=0.9.40",
     "pytest>=9.1.1",
     "ruff>=0.16.9",
     "ty>=0.0.84",
@@ -197,3 +198,24 @@ docstring-code-line-length = 100
 # The network-gated tests are skipped unless `--run-network` is passed; see `tests/conftest.py`.
 testpaths = ["tests"]
 markers = ["network: hits the real DWD open-data server"]
+
+# pydoclint checks a docstring's `Args:` and `Returns:` sections against the signature, which is
+# the half of docstring drift ruff leaves uncovered. It runs from an isolated environment (see
+# `.pre-commit-config.yaml`) and reads this table.
+[tool.pydoclint]
+style = "google"
+arg-type-hints-in-docstring = false
+check-return-types = false
+check-yield-types = false
+skip-checking-raises = true
+allow-init-docstring = true
+exclude = '\.git|\.venv'
+
+[tool.pymarkdown]
+# Prose in README.md is hard-wrapped at 100 characters. Headings and tables are exempt.
+plugins.md013.enabled = true
+plugins.md013.line_length = 100
+plugins.md013.tables = false
+plugins.md013.code_blocks = false
+plugins.md013.headings = false
+plugins.md024.siblings_only = true

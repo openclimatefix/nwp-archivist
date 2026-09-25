@@ -1,0 +1,11 @@
+# systemd user timer: run nwp-archive.service every 15 minutes, and once at start-up if a run
+# was missed while the machine was off.
+[Unit]
+Description=Record DWD ensemble weather products every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target
