@@ -1,11 +1,13 @@
 """Test helpers for MOGREPS-UK: synthetic HDF5 files, a fake bucket that serves byte ranges."""
 
 import io
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import h5py
 import httpx
@@ -16,6 +18,7 @@ from nwp_archivist.dwd import Fetcher
 from nwp_archivist.mogreps import LambertAzimuthalEqualArea, MogrepsSource, box_rectangle
 from nwp_archivist.products import ExpectedFile, Field, Product
 from nwp_archivist.recorder import Recorder, RecorderConfig
+from nwp_archivist.source import Cropped, NotYet
 from nwp_archivist.store import StoreLocation
 
 BUCKET_URL = "https://bucket.test/uk-ensemble"
@@ -192,6 +195,7 @@ def build_mogreps_recorder(
     clock: Clock,
     *,
     reporter: FakeReporter | None = None,
+    worker_source_factory: Callable[[], Any] | None = None,
     **config_overrides: object,
 ) -> tuple[Recorder, FakeReporter]:
     """Build a recorder wired to the fake bucket, a local store, and a fake reporter."""
@@ -214,8 +218,37 @@ def build_mogreps_recorder(
         reporter=reporter,
         clock=clock,
         mogreps_source=MogrepsSource(fetcher=fetcher, base_url=BUCKET_URL),
+        **(
+            {}
+            if worker_source_factory is None
+            else {"worker_source_factory": worker_source_factory}
+        ),
     )
     return recorder, reporter
+
+
+class FakeWorkerSource:
+    """A source for worker processes that needs no network: it logs the process that fetched.
+
+    The environment variable `FAKE_WORKER_LOG` names a file that gets one line per fetched file, and
+    `FAKE_WORKER_FAIL` names a variable whose files raise an exception.
+    """
+
+    def fetch(self, file: ExpectedFile, grid: object) -> Cropped | NotYet:
+        """Return the file's synthetic crop, or raise for the variable named to fail."""
+        with open(os.environ["FAKE_WORKER_LOG"], "a") as log:  # noqa: PTH123
+            log.write(f"{os.getpid()}\n")
+        if file.field.variable == os.environ.get("FAKE_WORKER_FAIL"):
+            message = "the fake worker was told to fail"
+            raise RuntimeError(message)
+        return Cropped(
+            expected_crop(file).astype(np.float32), N_ROWS * N_COLUMNS, 1308, REALIZATIONS
+        )
+
+
+def make_fake_worker_source() -> FakeWorkerSource:
+    """Build the fake source in a worker process."""
+    return FakeWorkerSource()
 
 
 def hours_after(init_time: datetime, hours: float) -> datetime:

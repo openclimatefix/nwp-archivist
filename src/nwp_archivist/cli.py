@@ -63,6 +63,13 @@ def build_parser() -> argparse.ArgumentParser:
             "nwp-archive-record)."
         ),
     )
+    parser.add_argument(
+        "--fetch-processes",
+        type=int,
+        default=1,
+        help="Worker processes that fetch MOGREPS-UK files (1 means threads in this process).",
+    )
+    parser.add_argument("--max-backfill-runs", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--workers", type=int, default=8, help="Files downloaded in parallel.")
     parser.add_argument(
         "--backfill-minutes",
@@ -115,6 +122,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_free_bytes=int(args.min_free_gib * 1024**3),
         workers=args.workers,
         backfill_seconds=args.backfill_minutes * 60,
+        fetch_processes=args.fetch_processes,
+        max_backfill_runs=args.max_backfill_runs,
     )
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -137,5 +146,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reporter=make_reporter(monitor_slug=monitor_slug),
                 mogreps_source=MogrepsSource(fetcher=fetcher),
             )
-            recorder.run_cycle([PRODUCTS[name] for name in args.products])
+            try:
+                recorder.run_cycle([PRODUCTS[name] for name in args.products])
+            finally:
+                recorder.close()
     return 0

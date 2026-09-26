@@ -61,13 +61,17 @@ their own. The DWD service uses the monitor `nwp-archive-dwd`. Override either w
 - **Reading** downloads only the chunks that overlap the rectangle, by byte range. One measured run
   took 5.5 GB of downloads in 54,000 requests and 29 minutes with 8 threads, and became 1.06 GB of
   archive.
+- **Fetching:** `--fetch-processes 4` runs four worker processes, because h5py's global lock
+  serialises the chunk-index reads and threads do not speed them up. Workers only write cropped
+  files to the local cache. The main process alone commits to the repository, updates the status,
+  and reports faults.
 - **Backfill:** each cycle handles the runs from the last 6 hours first. It then spends at most
-  `--backfill-minutes` (default 15; the service uses 10) on older runs still in the bucket, with
-  fewer download threads, so the backfill goes on in slices. The main runs (00, 06, 12 and 18 UTC)
-  come first and the other hours after them, each group newest first. The bucket holds about 720
-  runs and one run takes about 29 minutes, so the backfill takes weeks and the oldest runs may
-  expire before it reaches them. A run with no file at all is recorded `missing` only 29 days after
-  its initialisation time, and until then it is looked at again after a delay that doubles from 30
+  `--backfill-minutes` (default 15; the service uses 10) on older runs still in the bucket, oldest
+  first, because the bucket deletes those first. The runs at 00, 06, 12 and 18 UTC come before the
+  other hours. A run cut short by the slice stays waiting and
+  resumes in the next cycle. A run older than 24 hours is committed `partial` only after a full
+  pass has tried every missing file, and a run with no file at all is recorded `missing` only 29
+  days after its initialisation time, looked at again meanwhile after a delay that doubles from 30
   minutes to 12 hours.
 
 ## Reading the archive

@@ -21,6 +21,9 @@ class _StubRecorder:
         self.products: list[Product] = []
         _StubRecorder.instances.append(self)
 
+    def close(self) -> None:
+        pass
+
     def run_cycle(self, products: list[Product]) -> bool:
         self.products = products
         return True

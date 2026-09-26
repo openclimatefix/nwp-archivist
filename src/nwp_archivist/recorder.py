@@ -22,6 +22,8 @@ import numpy as np
 
 from nwp_archivist.cache import ProductCache, RunCache, RunGrid
 from nwp_archivist.dwd import DwdSource, Fetcher
+from nwp_archivist.mogreps import make_mogreps_source
+from nwp_archivist.pool import FetchPassResult, FetchPool, fetch_sequence
 from nwp_archivist.products import DWD_BASE_URL, ExpectedFile, Product, run_init_times
 from nwp_archivist.reporting import FaultType, Reporter
 from nwp_archivist.source import NotYet, Source
@@ -107,6 +109,10 @@ class RecorderConfig:
             up stops at its next file.
         backfill_workers: The number of files downloaded in parallel for a run that is not live,
             which keeps the backfill's request rate modest.
+        fetch_processes: The number of worker processes that fetch MOGREPS-UK files. With 1, files
+            are fetched by threads in the main process. Workers only write cropped files to the
+            local cache; the main process alone commits to the repository.
+        max_backfill_runs: The most runs a cycle backfills, or `None` for no limit.
     """
 
     store: StoreLocation
@@ -117,17 +123,8 @@ class RecorderConfig:
     base_url: str = DWD_BASE_URL
     backfill_seconds: float = 15 * 60.0
     backfill_workers: int = 2
-
-
-@dataclass
-class _FetchPassResult:
-    """What one fetch pass over a run's files found."""
-
-    generating_process: int | None = None
-    grid_changed: str | None = None
-    n_fetched: int = 0
-    transient: bool = False
-    member_ids: tuple[int, ...] = ()
+    fetch_processes: int = 1
+    max_backfill_runs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -187,6 +184,7 @@ class Recorder:
         reporter: Reporter,
         clock: Callable[[], datetime] = _utc_now,
         mogreps_source: Source | None = None,
+        worker_source_factory: Callable[[], Source] = make_mogreps_source,
     ) -> None:
         """Build a recorder.
 
@@ -196,6 +194,8 @@ class Recorder:
             reporter: Where faults and the cycle check-in go.
             clock: Returns the current time, replaceable so that tests control time.
             mogreps_source: Reads MOGREPS-UK files, if that product is recorded.
+            worker_source_factory: Builds a worker process's own MOGREPS-UK source. It must be a
+                module-level function, so that it can be pickled.
         """
         self.config = config
         self.reporter = reporter
@@ -205,7 +205,17 @@ class Recorder:
         }
         if mogreps_source is not None:
             self._sources["mogreps"] = mogreps_source
+        self._pool = (
+            FetchPool(processes=config.fetch_processes, source_factory=worker_source_factory)
+            if config.fetch_processes > 1
+            else None
+        )
         self._code_version = code_version()
+
+    def close(self) -> None:
+        """Stop the fetch worker processes, if there are any."""
+        if self._pool is not None:
+            self._pool.close()
 
     def run_cycle(self, products: Sequence[Product]) -> bool:
         """Run one recording cycle over `products`.
@@ -263,11 +273,11 @@ class Recorder:
             for run in runs
             if product.live_hours is None or now - run <= timedelta(hours=product.live_hours)
         ]
-        # A backfill takes the main runs (hours 00, 06, 12 and 18) before the others, newest first
-        # within each group.
+        # A backfill starts with the oldest run, because the provider deletes the oldest first. The
+        # runs at 00, 06, 12 and 18 UTC come before the other hours.
         backfill_runs = sorted(
-            set(runs) - set(live_runs), key=lambda run: (run.hour % 6 != 0, -run.timestamp())
-        )
+            set(runs) - set(live_runs), key=lambda run: (run.hour % 6 != 0, run.timestamp())
+        )[: self.config.max_backfill_runs]
         backfill_end: float | None = None
         oldest_fetched: datetime | None = None
         for init_time in (*live_runs, *backfill_runs):
@@ -294,6 +304,7 @@ class Recorder:
                     stop=(lambda end=backfill_end: time.monotonic() >= end)
                     if backfill_end
                     else None,
+                    stop_at=backfill_end,
                 )
             except Exception as error:
                 logger.warning(
@@ -366,6 +377,7 @@ class Recorder:
         init_time: datetime,
         now: datetime,
         stop: Callable[[], bool] | None = None,
+        stop_at: float | None = None,
     ) -> _RunOutcome:
         """Fetch what is missing of one run and commit it if it is complete or past its deadline.
 
@@ -377,6 +389,7 @@ class Recorder:
             init_time: The run's initialisation time.
             now: The time this cycle started.
             stop: Says when the fetch pass should give up on the rest of the run, or `None`.
+            stop_at: The same time as a `time.monotonic()` reading, for worker processes.
 
         Returns:
             Whether the run was handled without a fault, how many files were downloaded, and
@@ -414,6 +427,8 @@ class Recorder:
                     exhaustive=exhaustive,
                     past_deadline=past_deadline,
                     stop=stop,
+                    stop_at=stop_at,
+                    source_is_pooled=product.source == "mogreps",
                 )
                 mismatch = mismatch or changed
             received = run_cache.count_received(files, n_cells=len(grid.cell_index))
@@ -614,6 +629,8 @@ class Recorder:
         exhaustive: bool,
         past_deadline: bool,
         stop: Callable[[], bool] | None,
+        stop_at: float | None,
+        source_is_pooled: bool,
     ) -> tuple[int, str | None]:
         """Fetch a run's files, repeating the pass at the deadline if a pass saw a transient error.
 
@@ -626,6 +643,8 @@ class Recorder:
                 first file that is not yet published.
             past_deadline: Whether the run's deadline has passed.
             stop: Says when to give up on the rest of the run, or `None`.
+            stop_at: The same time as a `time.monotonic()` reading, for worker processes.
+            source_is_pooled: Whether the provider's files are fetched by the process pool, if any.
 
         Returns:
             How many files were downloaded, and how the grid differs from the archive's, if it does.
@@ -641,6 +660,8 @@ class Recorder:
                 exhaustive=exhaustive,
                 workers=self.config.backfill_workers if stop else self.config.workers,
                 stop=stop,
+                stop_at=stop_at,
+                pool=self._pool if source_is_pooled else None,
             )
             n_fetched += result.n_fetched
             grid_changed = grid_changed or result.grid_changed
@@ -666,7 +687,9 @@ class Recorder:
         exhaustive: bool,
         workers: int,
         stop: Callable[[], bool] | None,
-    ) -> _FetchPassResult:
+        stop_at: float | None,
+        pool: FetchPool | None,
+    ) -> FetchPassResult:
         """Make one pass over the run's files, caching each one that has arrived.
 
         Files appear in step order, so unless `exhaustive` a sequence (as the source defines it)
@@ -675,42 +698,35 @@ class Recorder:
         sequences: dict[tuple[str, ...], list[ExpectedFile]] = {}
         for file in files:
             sequences.setdefault(source.sequence_key(file), []).append(file)
-        n_cells = len(grid.cell_index)
-
-        def fetch_sequence(sequence: list[ExpectedFile]) -> _FetchPassResult:
-            partial = _FetchPassResult()
-            for file in sequence:
-                if stop is not None and stop():
-                    break
-                if run_cache.has(file, n_cells=n_cells):
-                    continue
-                outcome = source.fetch(file, grid)
-                if isinstance(outcome, NotYet):
-                    if outcome.reason != "404":
-                        partial.transient = True
-                        logger.warning("%s is not usable yet: %s", file.url, outcome.reason)
-                    if exhaustive:
-                        continue
-                    break
-                if outcome.n_points != grid.n_points:
-                    partial.grid_changed = (
-                        f"a file has {outcome.n_points} cells, the archive's grid has "
-                        f"{grid.n_points}"
+        if pool is not None:
+            partials = pool.run(
+                sequences=list(sequences.values()),
+                grid=grid,
+                run_cache=run_cache,
+                exhaustive=exhaustive,
+                stop_at=stop_at,
+            )
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as threads:
+                partials = list(
+                    threads.map(
+                        lambda sequence: fetch_sequence(
+                            source=source,
+                            sequence=sequence,
+                            grid=grid,
+                            run_cache=run_cache,
+                            exhaustive=exhaustive,
+                            stop=stop,
+                        ),
+                        sequences.values(),
                     )
-                    continue
-                run_cache.save(file, outcome.values)
-                partial.n_fetched += 1
-                partial.generating_process = outcome.generating_process
-                partial.member_ids = outcome.member_ids
-            return partial
-
-        result = _FetchPassResult()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for partial in pool.map(fetch_sequence, sequences.values()):
-                result.grid_changed = result.grid_changed or partial.grid_changed
-                result.n_fetched += partial.n_fetched
-                result.transient |= partial.transient
-                if partial.generating_process is not None:
-                    result.generating_process = partial.generating_process
-                result.member_ids = partial.member_ids or result.member_ids
+                )
+        result = FetchPassResult()
+        for partial in partials:
+            result.grid_changed = result.grid_changed or partial.grid_changed
+            result.n_fetched += partial.n_fetched
+            result.transient |= partial.transient
+            if partial.generating_process is not None:
+                result.generating_process = partial.generating_process
+            result.member_ids = partial.member_ids or result.member_ids
         return result

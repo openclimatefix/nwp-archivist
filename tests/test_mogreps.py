@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from support_mogreps import (
     build_mogreps_recorder,
     expected_crop,
     hours_after,
+    make_fake_worker_source,
     make_file,
 )
 
@@ -34,7 +36,12 @@ from nwp_archivist import recorder as recorder_module
 from nwp_archivist.cache import ProductCache
 from nwp_archivist.dwd import Fetcher
 from nwp_archivist.mogreps import LambertAzimuthalEqualArea, MogrepsSource, box_rectangle
-from nwp_archivist.products import BOX_LAT_MAX, BOX_LAT_MIN, MOGREPS_UK, ExpectedFile
+from nwp_archivist.products import (
+    BOX_LAT_MAX,
+    BOX_LAT_MIN,
+    MOGREPS_UK,
+    ExpectedFile,
+)
 from nwp_archivist.reporting import FaultType
 from nwp_archivist.source import Cropped, NotYet
 from nwp_archivist.store import (
@@ -383,18 +390,6 @@ def test_a_live_run_is_handled_before_the_backfill_and_the_backfill_has_a_time_b
     assert bucket.urls_of_run(old) == []
 
 
-def test_the_backfill_records_the_older_runs_newest_first(tmp_path: Path) -> None:
-    older = [hours_after(INIT, -offset) for offset in (8, 10)]
-    bucket = FakeBucket()
-    recorder, _ = build_mogreps_recorder(
-        tmp_path, bucket, Clock(SOON), lookback_hours=14.0, backfill_seconds=3600.0
-    )
-    recorder.run_cycle([TINY_MOGREPS])
-    assert all(_status(tmp_path, init) == STATUS_COMPLETE for init in [INIT, *older])
-    first_urls = [bucket.requests.index(bucket.urls_of_run(init)[0]) for init in older]
-    assert first_urls[0] < first_urls[1]
-
-
 def test_a_run_with_no_files_is_looked_at_again_only_after_a_growing_delay(
     tmp_path: Path,
 ) -> None:
@@ -522,30 +517,85 @@ def test_a_budget_that_ends_mid_run_leaves_an_old_run_waiting_and_resumes_it(
     assert "partial" not in _faults(reporter)
 
 
-def test_the_backfill_of_runs_older_than_the_deadline_goes_newest_first(tmp_path: Path) -> None:
-    older = [hours_after(INIT, -offset) for offset in (26, 28, 29)]  # hours 10, 8 and 7
+def test_the_backfill_goes_oldest_first_after_the_live_runs_and_over_24_hours(
+    tmp_path: Path,
+) -> None:
+    older = [hours_after(INIT, -offset) for offset in (26, 28, 29)]  # older than the deadline
     bucket = FakeBucket()
     recorder, _ = build_mogreps_recorder(
         tmp_path, bucket, Clock(SOON), lookback_hours=40.0, backfill_seconds=3600.0
     )
     recorder.run_cycle([TINY_MOGREPS])
-    firsts = [bucket.requests.index(bucket.urls_of_run(init)[0]) for init in older]
-    assert firsts == sorted(firsts)
-    assert all(_status(tmp_path, init) == STATUS_COMPLETE for init in older)
+    first = {run: bucket.requests.index(bucket.urls_of_run(run)[0]) for run in [INIT, *older]}
+    assert first[INIT] < min(first[run] for run in older)  # the live run comes first
+    assert first[older[2]] < first[older[1]] < first[older[0]]  # then oldest first
+    assert all(_status(tmp_path, run) == STATUS_COMPLETE for run in older)
 
 
-def test_the_backfill_records_the_main_run_hours_before_the_others(tmp_path: Path) -> None:
-    # Hours 06 and 12 are main runs; the runs at 08 and 10 are newer than the run at 06.
-    offsets = [26, 28, 30, 31]  # 10Z, 08Z, 06Z and 05Z of the day before
-    older = [hours_after(INIT, -offset) for offset in offsets]
-    bucket = FakeBucket()
+def test_the_backfill_records_the_main_hours_before_the_others_each_oldest_first(
+    tmp_path: Path,
+) -> None:
+    # Hours before INIT (12Z): 26 is 10Z, 28 is 08Z, 30 is 06Z, 31 is 05Z, 36 is 00Z.
+    runs = [hours_after(INIT, -offset) for offset in (26, 28, 30, 31, 36)]
+    bucket = FakeBucket(published=lambda file: file.init_time in {*runs, INIT})
     recorder, _ = build_mogreps_recorder(
-        tmp_path, bucket, Clock(SOON), lookback_hours=34.0, backfill_seconds=3600.0
+        tmp_path, bucket, Clock(SOON), lookback_hours=40.0, backfill_seconds=3600.0
     )
     recorder.run_cycle([TINY_MOGREPS])
-    start = {init: bucket.requests.index(bucket.urls_of_run(init)[0]) for init in older}
-    main = [init for init in older if init.hour % 6 == 0]
-    other = [init for init in older if init.hour % 6 != 0]
-    assert main
-    assert other
-    assert max(start[init] for init in main) < min(start[init] for init in other)
+    first = {run: bucket.requests.index(bucket.urls_of_run(run)[0]) for run in runs}
+    order = sorted(runs, key=lambda run: first[run])
+    assert order == [runs[4], runs[2], runs[3], runs[1], runs[0]]  # 00Z, 06Z, then 05Z, 08Z, 10Z
+
+
+def _pooled_recorder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: str | None = None
+) -> tuple[object, FakeBucket, object, Path]:
+    log = tmp_path / "workers.log"
+    monkeypatch.setenv("FAKE_WORKER_LOG", str(log))
+    if fail:
+        monkeypatch.setenv("FAKE_WORKER_FAIL", fail)
+    bucket = FakeBucket()
+    recorder, reporter = build_mogreps_recorder(
+        tmp_path,
+        bucket,
+        Clock(SOON),
+        lookback_hours=3.0,
+        fetch_processes=2,
+        worker_source_factory=make_fake_worker_source,
+    )
+    return recorder, bucket, reporter, log
+
+
+def test_worker_processes_fetch_and_the_main_process_alone_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder, bucket, reporter, log = _pooled_recorder(tmp_path, monkeypatch)
+    try:
+        recorder.run_cycle([TINY_MOGREPS])  # ty: ignore[unresolved-attribute]
+    finally:
+        recorder.close()  # ty: ignore[unresolved-attribute]
+    pids = set(log.read_text().split())
+    assert pids
+    assert str(os.getpid()) not in pids
+    # The main process read only the grid file over HTTP; the workers fetched every data file.
+    assert all("PT0000H00M" in url for url in bucket.requests)
+    assert _status(tmp_path) == STATUS_COMPLETE
+    assert _faults(reporter) == []
+    repository = _store(tmp_path).repository
+    assert len(list(repository.ancestry(branch="main"))) == 1 + 1 + 1  # initial, layout, one run
+    stored = _stored(tmp_path, "wind_100m")[slot_for(TINY_MOGREPS, INIT)]
+    np.testing.assert_allclose(stored[1, 1], expected_crop(_file("wind_100m", 60, 2)), rtol=2**-12)
+
+
+def test_a_worker_exception_leaves_the_run_waiting_and_the_other_files_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder, _, reporter, _ = _pooled_recorder(tmp_path, monkeypatch, fail="sw")
+    try:
+        assert recorder.run_cycle([TINY_MOGREPS])  # ty: ignore[unresolved-attribute]
+    finally:
+        recorder.close()  # ty: ignore[unresolved-attribute]
+    assert _status(tmp_path) == 0
+    assert _faults(reporter) == []
+    run_cache = ProductCache(root=tmp_path / "cache", product=TINY_MOGREPS.name).run(INIT)
+    assert len(list(run_cache.directory.rglob("*.npy"))) == 9  # the wind files, not the sw ones

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from typing import Final
 
 import h5py
+import httpx
 import numpy as np
 
 from nwp_archivist.cache import RunGrid
@@ -44,6 +45,9 @@ BLOCK_BYTES: Final[int] = 64 * 1024
 COALESCE_GAP_BYTES: Final[int] = 64 * 1024
 # netCDF's default fill value is 9.97e36. A cell holding it was never written.
 FILL_THRESHOLD: Final[float] = 1e30
+# Lead times of one variable are fetched in sequences of this many minutes.
+SEQUENCE_MINUTES: Final[int] = 8 * 60
+REQUEST_TIMEOUT_SECONDS: Final[float] = 60.0
 STATIC_NAMES: Final[frozenset[str]] = frozenset({"clat", "clon"})
 
 
@@ -316,8 +320,11 @@ class MogrepsSource:
         ]
 
     def sequence_key(self, file: ExpectedFile) -> tuple[str, ...]:
-        """One variable, all its members, is a sequence."""
-        return (file.field.variable,)
+        """Eight hours of lead times of one variable, all members, is a sequence.
+
+        The short sequences spread the work of one variable over several worker processes.
+        """
+        return (file.field.variable, str(file.step_minutes // SEQUENCE_MINUTES))
 
     def static_names(self, product: Product) -> set[str]:
         """The grid fields the archive stores once."""
@@ -488,3 +495,8 @@ def _coalesce(
         else:
             groups.append([chunk])
     return groups
+
+
+def make_mogreps_source() -> MogrepsSource:
+    """Build a source with its own HTTP client, for a worker process."""
+    return MogrepsSource(fetcher=Fetcher(client=httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)))

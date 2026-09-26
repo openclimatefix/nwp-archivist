@@ -12,10 +12,11 @@ Type=oneshot
 WorkingDirectory=%h/dev/nwp-archivist
 EnvironmentFile=-%h/.config/nwp-archive.env
 # A cycle handles the live runs first and then spends at most --backfill-minutes on older runs that
-# are still in the bucket (which keeps a run for about 30 days), newest first. The timer starts the
+# are still in the bucket (which keeps a run for about 30 days), oldest first. Four worker processes fetch the files, because h5py's global lock stops threads
+# from speeding up the chunk-index reads; only this main process writes to the repository. The timer starts the
 # next cycle 1 minute after this one exits, so the backfill goes on in 10-minute slices and a new
-# run waits at most one slice. Two workers download files for the older runs.
-ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 10
+# run waits at most one slice.
+ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 10 --fetch-processes 4
 # A hung cycle is killed after 3 hours. The cache directory's lock stops two cycles overlapping.
 TimeoutStartSec=3h
 Nice=10
