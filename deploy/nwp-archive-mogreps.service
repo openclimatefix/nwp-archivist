@@ -21,5 +21,7 @@ ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --
 TimeoutStartSec=3h
 # Four worker processes and the main process hold cropped runs of about 0.5 GB each in memory.
 MemoryMax=20G
-TasksMax=64
+TasksMax=512
+# Each worker process would start one numerical-library thread per core, which exhausted the task limit.
+Environment=OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 Nice=10
