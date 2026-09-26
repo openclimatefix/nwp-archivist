@@ -532,3 +532,20 @@ def test_the_backfill_of_runs_older_than_the_deadline_goes_newest_first(tmp_path
     firsts = [bucket.requests.index(bucket.urls_of_run(init)[0]) for init in older]
     assert firsts == sorted(firsts)
     assert all(_status(tmp_path, init) == STATUS_COMPLETE for init in older)
+
+
+def test_the_backfill_records_the_main_run_hours_before_the_others(tmp_path: Path) -> None:
+    # Hours 06 and 12 are main runs; the runs at 08 and 10 are newer than the run at 06.
+    offsets = [26, 28, 30, 32]  # hours before INIT (12Z): 10Z, 08Z, 06Z of the day before, 04Z
+    older = [hours_after(INIT, -offset) for offset in offsets]
+    bucket = FakeBucket()
+    recorder, _ = build_mogreps_recorder(
+        tmp_path, bucket, Clock(SOON), lookback_hours=34.0, backfill_seconds=3600.0
+    )
+    recorder.run_cycle([TINY_MOGREPS])
+    start = {init: bucket.requests.index(bucket.urls_of_run(init)[0]) for init in older}
+    main = [init for init in older if init.hour % 6 == 0]
+    other = [init for init in older if init.hour % 6 != 0]
+    assert main
+    assert other
+    assert max(start[init] for init in main) < min(start[init] for init in other)

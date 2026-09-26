@@ -263,8 +263,11 @@ class Recorder:
             for run in runs
             if product.live_hours is None or now - run <= timedelta(hours=product.live_hours)
         ]
-        # A backfill starts with the newest run, because the provider deletes the oldest first.
-        backfill_runs = sorted(set(runs) - set(live_runs), reverse=True)
+        # A backfill takes the main runs (hours 00, 06, 12 and 18) before the others, newest first
+        # within each group.
+        backfill_runs = sorted(
+            set(runs) - set(live_runs), key=lambda run: (run.hour % 6 != 0, -run.timestamp())
+        )
         backfill_end: float | None = None
         oldest_fetched: datetime | None = None
         for init_time in (*live_runs, *backfill_runs):

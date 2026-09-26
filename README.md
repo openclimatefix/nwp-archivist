@@ -62,8 +62,8 @@ their own. The DWD service uses the monitor `nwp-archive-dwd`. Override either w
   took 5.5 GB of downloads in 54,000 requests and 29 minutes with 8 threads, and became 1.06 GB of
   archive.
 - **Backfill:** each cycle handles the runs from the last 6 hours first. It then spends at most
-  `--backfill-minutes` (default 15; the service uses 10) on older runs still in the bucket, newest
-  first, with fewer download threads, so the backfill goes on in slices. The bucket holds about 720
+  `--backfill-minutes` (default 15; the service uses 10) on older runs still in the bucket, main runs
+  (00, 06, 12 and 18 UTC) first and the other hours after them, each newest first, with fewer download threads, so the backfill goes on in slices. The bucket holds about 720
   runs and one run takes about 29 minutes, so the backfill takes weeks and the oldest runs may
   expire before it reaches them. A run with no file at all is recorded `missing` only 29 days after its
   initialisation time, and until then it is looked at again after a delay that doubles from 30
