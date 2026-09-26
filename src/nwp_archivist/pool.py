@@ -30,6 +30,14 @@ class FetchPassResult:
     n_fetched: int = 0
     transient: bool = False
     member_ids: tuple[int, ...] = ()
+    crashed: str | None = None
+
+
+class FetchCrashedError(RuntimeError):
+    """A worker process failed or the pool timed out, so the run's files are in an unknown state.
+
+    This is our own fault and not the provider's, so a run is never committed after it.
+    """
 
 
 def fetch_sequence(
@@ -101,9 +109,9 @@ def _run_in_worker(
             exhaustive=exhaustive,
             stop=None if stop_at is None else (lambda: time.monotonic() >= stop_at),
         )
-    except Exception:
+    except Exception as error:
         logger.warning("a fetch worker failed on %s", sequence[0].url, exc_info=True)
-        return FetchPassResult(transient=True)
+        return FetchPassResult(crashed=f"a fetch worker failed: {error!r}")
 
 
 class FetchPool:
@@ -139,8 +147,15 @@ class FetchPool:
         run_cache: RunCache,
         exhaustive: bool,
         stop_at: float | None,
+        timeout_seconds: float,
     ) -> list[FetchPassResult]:
-        """Fetch every sequence, returning one result each (transient if its worker failed)."""
+        """Fetch every sequence, returning one result each.
+
+        A sequence whose worker failed, or that had not finished after `timeout_seconds` for the
+        whole pass, gets a result with `crashed` set. On such a failure the workers are terminated
+        and waited for, so that none is left writing, and the next pass starts a fresh pool.
+        """
+        give_up = time.monotonic() + timeout_seconds
         futures = [
             self._pool().submit(
                 _run_in_worker, sequence, grid, run_cache.directory, exhaustive, stop_at
@@ -150,15 +165,21 @@ class FetchPool:
         results: list[FetchPassResult] = []
         for future in futures:
             try:
-                results.append(future.result())
-            except Exception:
+                results.append(future.result(timeout=max(give_up - time.monotonic(), 0.0)))
+            except Exception as error:
                 logger.warning("the fetch pool failed", exc_info=True)
                 self.close()
-                results.append(FetchPassResult(transient=True))
+                results.append(FetchPassResult(crashed=f"the fetch pool failed: {error!r}"))
         return results
 
     def close(self) -> None:
-        """Stop the worker processes. A later `run` starts new ones."""
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
+        """Terminate the worker processes and wait for them. A later `run` starts new ones."""
+        executor, self._executor = self._executor, None
+        if executor is None:
+            return
+        workers = list(getattr(executor, "_processes", {}).values())
+        for worker in workers:
+            worker.terminate()
+        executor.shutdown(wait=True, cancel_futures=True)
+        for worker in workers:
+            worker.join()

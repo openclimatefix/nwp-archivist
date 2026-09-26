@@ -19,4 +19,7 @@ EnvironmentFile=-%h/.config/nwp-archive.env
 ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 10 --fetch-processes 4
 # A hung cycle is killed after 3 hours. The cache directory's lock stops two cycles overlapping.
 TimeoutStartSec=3h
+# Four worker processes and the main process hold cropped runs of about 0.5 GB each in memory.
+MemoryMax=20G
+TasksMax=64
 Nice=10

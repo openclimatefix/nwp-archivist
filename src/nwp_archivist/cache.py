@@ -7,6 +7,7 @@ cache, are the record of what is committed: the "done" markers here only save a 
 
 import io
 import json
+import os
 import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,7 +29,8 @@ _TIMESTAMP_FORMAT = "%Y%m%dT%H%M"
 def _write_atomically(path: Path, data: bytes) -> None:
     """Write bytes so that a crash leaves either no file or the whole file, never a part."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
+    # The process id keeps two writers of one path, such as a worker that outlived its pool, apart.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("wb") as handle:
         handle.write(data)
     temporary.replace(path)

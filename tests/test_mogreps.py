@@ -548,20 +548,27 @@ def test_the_backfill_records_the_main_hours_before_the_others_each_oldest_first
 
 
 def _pooled_recorder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: str | None = None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    now: datetime = SOON,
+    lookback_hours: float = 3.0,
+    failure: tuple[str, str] | None = None,
+    **config: object,
 ) -> tuple[object, FakeBucket, object, Path]:
     log = tmp_path / "workers.log"
     monkeypatch.setenv("FAKE_WORKER_LOG", str(log))
-    if fail:
-        monkeypatch.setenv("FAKE_WORKER_FAIL", fail)
-    bucket = FakeBucket()
+    if failure:
+        monkeypatch.setenv(*failure)
+    bucket = FakeBucket(published=lambda file: file.init_time == INIT)
     recorder, reporter = build_mogreps_recorder(
         tmp_path,
         bucket,
-        Clock(SOON),
-        lookback_hours=3.0,
+        Clock(now),
+        lookback_hours=lookback_hours,
         fetch_processes=2,
         worker_source_factory=make_fake_worker_source,
+        **config,  # ty: ignore[invalid-argument-type]
     )
     return recorder, bucket, reporter, log
 
@@ -587,15 +594,73 @@ def test_worker_processes_fetch_and_the_main_process_alone_commits(
     np.testing.assert_allclose(stored[1, 1], expected_crop(_file("wind_100m", 60, 2)), rtol=2**-12)
 
 
-def test_a_worker_exception_leaves_the_run_waiting_and_the_other_files_cached(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "failure",
+    [("FAKE_WORKER_FAIL", "sw"), ("FAKE_WORKER_DIE", "sw")],
+    ids=["exception", "broken-pool"],
+)
+def test_a_crashed_pass_never_commits_a_run_even_past_its_deadline_and_reports_it_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: tuple[str, str]
 ) -> None:
-    recorder, _, reporter, _ = _pooled_recorder(tmp_path, monkeypatch, fail="sw")
+    # 30 h after the run started, its 24 h deadline has passed, so a transient failure would commit
+    # it as partial.
+    recorder, _, reporter, _ = _pooled_recorder(
+        tmp_path, monkeypatch, now=hours_after(INIT, 30), lookback_hours=31.0, failure=failure
+    )
     try:
-        assert recorder.run_cycle([TINY_MOGREPS])  # ty: ignore[unresolved-attribute]
+        for _ in range(2):
+            assert not recorder.run_cycle([TINY_MOGREPS])  # ty: ignore[unresolved-attribute]
     finally:
         recorder.close()  # ty: ignore[unresolved-attribute]
     assert _status(tmp_path) == 0
-    assert _faults(reporter) == []
+    assert _faults(reporter).count("run_error") == 1
+    assert "partial" not in _faults(reporter)
+    assert "missing" not in _faults(reporter)
+    (product, init, fault, _) = next(f for f in reporter.faults if f[2] == "run_error")  # ty: ignore[unresolved-attribute]
+    assert (product, init, fault) == ("tiny-mogreps", INIT, "run_error")
     run_cache = ProductCache(root=tmp_path / "cache", product=TINY_MOGREPS.name).run(INIT)
-    assert len(list(run_cache.directory.rglob("*.npy"))) == 9  # the wind files, not the sw ones
+    assert run_cache.directory.exists()
+
+
+def test_a_pool_pass_that_times_out_terminates_the_workers_and_commits_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder, _, reporter, _ = _pooled_recorder(
+        tmp_path,
+        monkeypatch,
+        failure=("FAKE_WORKER_SLEEP", "sw"),
+        pool_live_timeout_seconds=3.0,
+    )
+    try:
+        assert not recorder.run_cycle([TINY_MOGREPS])  # ty: ignore[unresolved-attribute]
+        assert recorder._pool._executor is None  # ty: ignore[unresolved-attribute]
+    finally:
+        recorder.close()  # ty: ignore[unresolved-attribute]
+    assert _status(tmp_path) == 0
+    assert _faults(reporter) == ["run_error"]
+
+
+def test_the_backfill_limit_counts_only_runs_not_yet_archived(tmp_path: Path) -> None:
+    bucket = FakeBucket()
+    recorder, _ = build_mogreps_recorder(
+        tmp_path,
+        bucket,
+        Clock(SOON),
+        lookback_hours=32.0,
+        backfill_seconds=3600.0,
+        max_backfill_runs=1,
+    )
+
+    def archived_old_runs() -> int:
+        statuses = _store(tmp_path).statuses()
+        old = [hours_after(SOON, -offset) for offset in range(7, 33)]
+        slots = {slot_for(TINY_MOGREPS, run.replace(minute=0)) for run in old}
+        return sum(1 for slot in slots if slot < len(statuses) and statuses[slot] != 0)
+
+    # Each cycle archives one more old run. If the limit counted archived runs, the second cycle
+    # would pick the first run again and archive nothing new.
+    counts = []
+    for _ in range(3):
+        recorder.run_cycle([TINY_MOGREPS])
+        counts.append(archived_old_runs())
+    assert counts == [1, 2, 3]

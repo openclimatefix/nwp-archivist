@@ -3,6 +3,7 @@
 import io
 import os
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -231,13 +232,18 @@ class FakeWorkerSource:
     """A source for worker processes that needs no network: it logs the process that fetched.
 
     The environment variable `FAKE_WORKER_LOG` names a file that gets one line per fetched file, and
-    `FAKE_WORKER_FAIL` names a variable whose files raise an exception.
+    `FAKE_WORKER_FAIL`, `FAKE_WORKER_DIE` and `FAKE_WORKER_SLEEP` name a variable whose files raise
+    an exception, kill the worker process, or hang for 60 seconds.
     """
 
     def fetch(self, file: ExpectedFile, grid: object) -> Cropped | NotYet:
         """Return the file's synthetic crop, or raise for the variable named to fail."""
         with open(os.environ["FAKE_WORKER_LOG"], "a") as log:  # noqa: PTH123
             log.write(f"{os.getpid()}\n")
+        if file.field.variable == os.environ.get("FAKE_WORKER_DIE"):
+            os._exit(1)
+        if file.field.variable == os.environ.get("FAKE_WORKER_SLEEP"):
+            time.sleep(60)
         if file.field.variable == os.environ.get("FAKE_WORKER_FAIL"):
             message = "the fake worker was told to fail"
             raise RuntimeError(message)

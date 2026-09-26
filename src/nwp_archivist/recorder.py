@@ -23,7 +23,7 @@ import numpy as np
 from nwp_archivist.cache import ProductCache, RunCache, RunGrid
 from nwp_archivist.dwd import DwdSource, Fetcher
 from nwp_archivist.mogreps import make_mogreps_source
-from nwp_archivist.pool import FetchPassResult, FetchPool, fetch_sequence
+from nwp_archivist.pool import FetchCrashedError, FetchPassResult, FetchPool, fetch_sequence
 from nwp_archivist.products import DWD_BASE_URL, ExpectedFile, Product, run_init_times
 from nwp_archivist.reporting import FaultType, Reporter
 from nwp_archivist.source import NotYet, Source
@@ -112,7 +112,10 @@ class RecorderConfig:
         fetch_processes: The number of worker processes that fetch MOGREPS-UK files. With 1, files
             are fetched by threads in the main process. Workers only write cropped files to the
             local cache; the main process alone commits to the repository.
-        max_backfill_runs: The most runs a cycle backfills, or `None` for no limit.
+        max_backfill_runs: The most unarchived runs a cycle backfills, or `None` for no limit.
+        pool_live_timeout_seconds: How long a pass over a live run may take in the worker pool.
+        pool_backfill_grace_seconds: How long a pass over an older run may take beyond the
+            backfill budget. A pass that takes longer counts as a crash.
     """
 
     store: StoreLocation
@@ -125,6 +128,8 @@ class RecorderConfig:
     backfill_workers: int = 2
     fetch_processes: int = 1
     max_backfill_runs: int | None = None
+    pool_live_timeout_seconds: float = 30 * 60.0
+    pool_backfill_grace_seconds: float = 10 * 60.0
 
 
 @dataclass(frozen=True)
@@ -276,7 +281,12 @@ class Recorder:
         # A backfill starts with the oldest run, because the provider deletes the oldest first. The
         # runs at 00, 06, 12 and 18 UTC come before the other hours.
         backfill_runs = sorted(
-            set(runs) - set(live_runs), key=lambda run: (run.hour % 6 != 0, run.timestamp())
+            (
+                run
+                for run in set(runs) - set(live_runs)
+                if not (_slot_archived(product, archived, run) or cache.is_done(run))
+            ),
+            key=lambda run: (run.hour % 6 != 0, run.timestamp()),
         )[: self.config.max_backfill_runs]
         backfill_end: float | None = None
         oldest_fetched: datetime | None = None
@@ -705,6 +715,11 @@ class Recorder:
                 run_cache=run_cache,
                 exhaustive=exhaustive,
                 stop_at=stop_at,
+                timeout_seconds=(
+                    max(stop_at - time.monotonic(), 0.0) + self.config.pool_backfill_grace_seconds
+                    if stop_at is not None
+                    else self.config.pool_live_timeout_seconds
+                ),
             )
         else:
             with ThreadPoolExecutor(max_workers=workers) as threads:
@@ -721,6 +736,11 @@ class Recorder:
                         sequences.values(),
                     )
                 )
+        crashes = [partial.crashed for partial in partials if partial.crashed]
+        if crashes:
+            # The run keeps what was cached and waits. Raising reports `run_error` once and stops
+            # the run from being committed, whatever its deadline.
+            raise FetchCrashedError(f"{len(crashes)} sequences crashed, first: {crashes[0]}")
         result = FetchPassResult()
         for partial in partials:
             result.grid_changed = result.grid_changed or partial.grid_changed
