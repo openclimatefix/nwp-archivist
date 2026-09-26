@@ -523,7 +523,7 @@ def test_a_budget_that_ends_mid_run_leaves_an_old_run_waiting_and_resumes_it(
 
 
 def test_the_backfill_of_runs_older_than_the_deadline_goes_newest_first(tmp_path: Path) -> None:
-    older = [hours_after(INIT, -offset) for offset in (26, 30, 34)]
+    older = [hours_after(INIT, -offset) for offset in (26, 28, 29)]  # hours 10, 8 and 7
     bucket = FakeBucket()
     recorder, _ = build_mogreps_recorder(
         tmp_path, bucket, Clock(SOON), lookback_hours=40.0, backfill_seconds=3600.0
@@ -536,7 +536,7 @@ def test_the_backfill_of_runs_older_than_the_deadline_goes_newest_first(tmp_path
 
 def test_the_backfill_records_the_main_run_hours_before_the_others(tmp_path: Path) -> None:
     # Hours 06 and 12 are main runs; the runs at 08 and 10 are newer than the run at 06.
-    offsets = [26, 28, 30, 32]  # hours before INIT (12Z): 10Z, 08Z, 06Z of the day before, 04Z
+    offsets = [26, 28, 30, 31]  # 10Z, 08Z, 06Z and 05Z of the day before
     older = [hours_after(INIT, -offset) for offset in offsets]
     bucket = FakeBucket()
     recorder, _ = build_mogreps_recorder(
