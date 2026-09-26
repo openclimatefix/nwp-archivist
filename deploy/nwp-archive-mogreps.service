@@ -1,4 +1,4 @@
-# systemd user unit: one MOGREPS-UK recording cycle. The timer starts it every 30 minutes.
+# systemd user unit: one MOGREPS-UK recording cycle. The timer starts the next 1 minute after.
 # Install: copy this file and nwp-archive-mogreps.timer to ~/.config/systemd/user/, then
 #   systemctl --user daemon-reload && systemctl --user enable --now nwp-archive-mogreps.timer
 # Settings (ARCHIVE_STORE_ROOT, optionally SENTRY_DSN) go in ~/.config/nwp-archive.env, which the
@@ -11,11 +11,11 @@ Description=Record one cycle of the MOGREPS-UK ensemble
 Type=oneshot
 WorkingDirectory=%h/dev/nwp-archivist
 EnvironmentFile=-%h/.config/nwp-archive.env
-# A cycle handles the live runs first and then spends at most --backfill-minutes on older runs
-# that are still in the bucket (which keeps a run for about 30 days). Two workers download files
-# for the older runs, so that the backfill's request rate stays modest.
-ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 50
-# The timer does not start a second cycle while one runs, and the cache directory's lock stops any
-# other cycle too, so a long backfill only delays the next live pass.
-TimeoutStartSec=infinity
+# A cycle handles the live runs first and then spends at most --backfill-minutes on older runs that
+# are still in the bucket (which keeps a run for about 30 days), newest first. The timer starts the
+# next cycle 1 minute after this one exits, so the backfill goes on in 10-minute slices and a new
+# run waits at most one slice. Two workers download files for the older runs.
+ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 10
+# A hung cycle is killed after 3 hours. The cache directory's lock stops two cycles overlapping.
+TimeoutStartSec=3h
 Nice=10

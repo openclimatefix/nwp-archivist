@@ -54,6 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=sorted(name for name, product in PRODUCTS.items() if product.source == "dwd"),
         help="The products to record (default: the DWD products).",
     )
+    parser.add_argument(
+        "--monitor-slug",
+        default=None,
+        help=(
+            "The Sentry cron monitor for this service (default: nwp-archive-<provider> when every "
+            "product has the same provider source, such as nwp-archive-dwd, otherwise "
+            "nwp-archive-record)."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=8, help="Files downloaded in parallel.")
     parser.add_argument(
         "--backfill-minutes",
@@ -93,6 +102,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.store_root:
         logging.getLogger(__name__).error("set --store-root or ARCHIVE_STORE_ROOT")
         return 2
+    sources = {PRODUCTS[name].source for name in args.products}
+    monitor_slug = args.monitor_slug or (
+        f"nwp-archive-{sources.pop()}" if len(sources) == 1 else "nwp-archive-record"
+    )
     config = RecorderConfig(
         store=StoreLocation(
             root=args.store_root,
@@ -121,7 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             recorder = Recorder(
                 config=config,
                 fetcher=fetcher,
-                reporter=make_reporter(),
+                reporter=make_reporter(monitor_slug=monitor_slug),
                 mogreps_source=MogrepsSource(fetcher=fetcher),
             )
             recorder.run_cycle([PRODUCTS[name] for name in args.products])

@@ -45,8 +45,9 @@ Delete that file once a person has decided what to do.
 
 `archive-record --products mogreps-uk` records the Met Office's public bucket
 `met-office-uk-ensemble-model-data`, which deletes each file about 30 days after it was written. The
-`deploy/nwp-archive-mogreps.service` and `.timer` run it every 30 minutes with a cache directory of
-its own.
+`deploy/nwp-archive-mogreps.service` and `.timer` run it as a chain of cycles, each starting 1 minute
+after the last exits, with a cache directory and a Sentry cron monitor (`nwp-archive-mogreps`) of
+their own. The DWD service uses the monitor `nwp-archive-dwd`. Override either with `--monitor-slug`.
 
 - **Fields**, all as delivered: total, direct, and diffuse downward shortwave at the surface, screen
   temperature, 10 m wind speed and direction, total cloud amount, and wind speed and direction at
@@ -61,8 +62,10 @@ its own.
   took 5.5 GB of downloads in 54,000 requests and 29 minutes with 8 threads, and became 1.06 GB of
   archive.
 - **Backfill:** each cycle handles the runs from the last 6 hours first. It then spends at most
-  `--backfill-minutes` (default 15) on older runs still in the bucket, newest first, with fewer
-  download threads. A run with no file at all is recorded `missing` only 29 days after its
+  `--backfill-minutes` (default 15; the service uses 10) on older runs still in the bucket, newest
+  first, with fewer download threads, so the backfill goes on in slices. The bucket holds about 720
+  runs and one run takes about 29 minutes, so the backfill takes weeks and the oldest runs may
+  expire before it reaches them. A run with no file at all is recorded `missing` only 29 days after its
   initialisation time, and until then it is looked at again after a delay that doubles from 30
   minutes to 12 hours.
 

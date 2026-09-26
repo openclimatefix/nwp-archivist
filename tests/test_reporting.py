@@ -43,7 +43,7 @@ def test_without_a_dsn_the_reporter_logs_the_fault_at_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.delenv("SENTRY_DSN", raising=False)
-    reporter = make_reporter()
+    reporter = make_reporter(monitor_slug="m")
     assert isinstance(reporter, LogReporter)
     with caplog.at_level(logging.WARNING):
         reporter.fault(product="icon-d2", init_time=INIT, fault="partial", detail="99 of 100")
@@ -61,11 +61,13 @@ def test_the_log_reporter_check_in_does_nothing() -> None:
 
 def test_an_empty_dsn_counts_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SENTRY_DSN", "")
-    assert isinstance(make_reporter(), LogReporter)
+    assert isinstance(make_reporter(monitor_slug="m"), LogReporter)
 
 
 def test_the_sentry_reporter_tags_the_product_run_and_fault(envelopes: list[Envelope]) -> None:
-    SentryReporter().fault(product="icon-d2", init_time=INIT, fault="missing", detail="none")
+    SentryReporter(monitor_slug="m").fault(
+        product="icon-d2", init_time=INIT, fault="missing", detail="none"
+    )
     sentry_sdk.get_client().flush()
     (event,) = _items(envelopes, "event")
     assert event["tags"] == {
@@ -79,14 +81,13 @@ def test_the_sentry_reporter_tags_the_product_run_and_fault(envelopes: list[Enve
 
 
 def test_the_sentry_reporter_sends_a_cron_check_in(envelopes: list[Envelope]) -> None:
-    SentryReporter().check_in(ok=True)
-    SentryReporter().check_in(ok=False)
+    SentryReporter(monitor_slug="nwp-archive-mogreps").check_in(ok=True)
+    SentryReporter(monitor_slug="nwp-archive-dwd").check_in(ok=False)
     sentry_sdk.get_client().flush()
     statuses = [item["status"] for item in _items(envelopes, "check_in")]
     assert statuses == ["ok", "error"]
-    assert {item["monitor_slug"] for item in _items(envelopes, "check_in")} == {
-        "nwp-archive-record"
-    }
+    slugs = [item["monitor_slug"] for item in _items(envelopes, "check_in")]
+    assert slugs == ["nwp-archive-mogreps", "nwp-archive-dwd"]
 
 
 def test_a_logged_error_does_not_become_an_untagged_sentry_event(
@@ -94,7 +95,7 @@ def test_a_logged_error_does_not_become_an_untagged_sentry_event(
 ) -> None:
     sent: list[Envelope] = []
     monkeypatch.setenv("SENTRY_DSN", "http://key@localhost/1")
-    reporter = make_reporter(transport=_CapturingTransport(sent))
+    reporter = make_reporter(monitor_slug="m", transport=_CapturingTransport(sent))
     assert isinstance(reporter, SentryReporter)
     try:
         logging.getLogger("nwp_archivist.recorder").error("commit failed")

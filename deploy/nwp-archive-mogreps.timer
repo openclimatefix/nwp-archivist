@@ -1,11 +1,11 @@
-# systemd user timer: run nwp-archive-mogreps.service every 30 minutes, and once at start-up if a
-# run was missed while the machine was off.
+# systemd user timer: run nwp-archive-mogreps.service 2 minutes after boot, then 1 minute after each
+# cycle exits, so that the backfill of older runs goes on in slices.
 [Unit]
-Description=Record MOGREPS-UK every 30 minutes
+Description=Record MOGREPS-UK, one cycle after another
 
 [Timer]
-OnCalendar=*:0/30
-Persistent=true
+OnBootSec=2min
+OnUnitInactiveSec=1min
 
 [Install]
 WantedBy=timers.target

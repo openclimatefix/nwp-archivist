@@ -8,7 +8,7 @@ import pytest
 from nwp_archivist import cli
 from nwp_archivist.products import PRODUCTS, Product
 from nwp_archivist.recorder import RecorderConfig
-from nwp_archivist.reporting import Reporter
+from nwp_archivist.reporting import LogReporter, Reporter
 
 
 class _StubRecorder:
@@ -112,3 +112,26 @@ def test_the_lock_is_released_when_a_cycle_ends(tmp_path: Path) -> None:
     cli.main(arguments)
     cli.main(arguments)
     assert len(_StubRecorder.instances) == 2
+
+
+@pytest.mark.parametrize(
+    ("arguments", "slug"),
+    [
+        ([], "nwp-archive-dwd"),
+        (["--products", "mogreps-uk"], "nwp-archive-mogreps"),
+        (["--products", "icon-d2", "mogreps-uk"], "nwp-archive-record"),
+        (["--products", "mogreps-uk", "--monitor-slug", "custom"], "custom"),
+    ],
+)
+def test_each_service_gets_its_own_sentry_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: list[str], slug: str
+) -> None:
+    slugs: list[str] = []
+
+    def fake_make_reporter(*, monitor_slug: str) -> Reporter:
+        slugs.append(monitor_slug)
+        return LogReporter()
+
+    monkeypatch.setattr(cli, "make_reporter", fake_make_reporter)
+    cli.main(["--store-root", str(tmp_path), "--cache-dir", str(tmp_path / "c"), *arguments])
+    assert slugs == [slug]

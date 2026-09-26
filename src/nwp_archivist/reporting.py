@@ -7,7 +7,7 @@ account still logs every event.
 import logging
 import os
 from datetime import datetime
-from typing import Final, Literal, Protocol
+from typing import Literal, Protocol
 
 import sentry_sdk
 from sentry_sdk.crons import capture_checkin
@@ -25,8 +25,6 @@ FaultType = Literal[
     "disk_low",
     "grid_unchecked",
 ]
-
-CRON_MONITOR_SLUG: Final[str] = "nwp-archive-record"
 
 
 class Reporter(Protocol):
@@ -65,6 +63,10 @@ class LogReporter:
 class SentryReporter:
     """Sends each fault to Sentry as a warning tagged with its product, run, and fault type."""
 
+    def __init__(self, *, monitor_slug: str) -> None:
+        """Build a reporter whose cron check-ins go to the Sentry monitor `monitor_slug`."""
+        self.monitor_slug = monitor_slug
+
     def fault(
         self, *, product: str, init_time: datetime | None, fault: FaultType, detail: str
     ) -> None:
@@ -92,13 +94,15 @@ class SentryReporter:
 
     def check_in(self, *, ok: bool) -> None:
         """Send a Sentry Crons check-in, so a dead recorder becomes visible."""
-        capture_checkin(monitor_slug=CRON_MONITOR_SLUG, status="ok" if ok else "error")
+        capture_checkin(monitor_slug=self.monitor_slug, status="ok" if ok else "error")
 
 
-def make_reporter(*, transport: Transport | None = None) -> Reporter:
+def make_reporter(*, monitor_slug: str, transport: Transport | None = None) -> Reporter:
     """Build the reporter the environment asks for.
 
     Args:
+        monitor_slug: The Sentry cron monitor of this service. Each service has its own, so that a
+            live service cannot keep a dead one's monitor green.
         transport: A replacement for Sentry's network transport, for tests.
 
     Returns:
@@ -116,4 +120,4 @@ def make_reporter(*, transport: Transport | None = None) -> Reporter:
         integrations=[LoggingIntegration(event_level=None)],
         transport=transport,
     )
-    return SentryReporter()
+    return SentryReporter(monitor_slug=monitor_slug)
