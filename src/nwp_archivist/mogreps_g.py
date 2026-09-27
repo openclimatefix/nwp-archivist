@@ -5,7 +5,7 @@ full global 20 km regular latitude-longitude grid, as an HDF5 (NetCDF4) dataset 
 by 128 cell blocks (and, for the two height-level wind fields, one level per chunk too) and
 compressed with deflate. Cropping the GB box therefore still means fetching only a handful of
 chunks by byte range rather than the whole file: the archive keeps a 67 by 48 cell rectangle out of
-960 by 1280, so about 4 of a level's 88 chunks are ever downloaded.
+960 by 1280, so about 4 of a level's 80 chunks are ever downloaded.
 
 Everything except how a run's grid is chosen is identical to MOGREPS-UK's `MogrepsSource`, so this
 module subclasses it and overrides only `fetch_grid`: MOGREPS-G's grid is a plain regular
