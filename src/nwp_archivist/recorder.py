@@ -206,10 +206,10 @@ class Recorder:
             reporter: Where faults and the cycle check-in go.
             clock: Returns the current time, replaceable so that tests control time.
             mogreps_source: Reads MOGREPS-UK files, if that product is recorded.
-            mogreps_g_source: Reads MOGREPS-G files, if that product is recorded.
             worker_source_factory: Builds a worker process's own MOGREPS-UK or MOGREPS-G source
                 (whichever the pool is fetching for). It must be a module-level function, so that
                 it can be pickled.
+            mogreps_g_source: Reads MOGREPS-G files, if that product is recorded.
         """
         self.config = config
         self.reporter = reporter

@@ -38,7 +38,7 @@ def _read_all(path: Path) -> dict[str, dict[str, object]]:
     """Every product's last-written entry, or `{}` if the file is absent or unreadable."""
     try:
         return json.loads(path.read_text())
-    except (FileNotFoundError, OSError, ValueError):
+    except FileNotFoundError, OSError, ValueError:
         return {}
 
 
@@ -77,7 +77,7 @@ def should_yield(path: Path, *, product: str, my_days_left: float, now: datetime
         try:
             days_left = float(entry["days_left"])  # ty: ignore[invalid-argument-type]
             written_at = datetime.fromisoformat(str(entry["written_at"]))
-        except (KeyError, TypeError, ValueError):
+        except KeyError, TypeError, ValueError:
             continue
         if written_at.tzinfo is None:
             written_at = written_at.replace(tzinfo=UTC)

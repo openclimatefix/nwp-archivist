@@ -17,13 +17,17 @@ import httpx
 import icechunk
 
 from nwp_archivist.dwd import Fetcher
-from nwp_archivist.mogreps import MogrepsSource
+from nwp_archivist.mogreps import MogrepsSource, make_mogreps_source
+from nwp_archivist.mogreps_g import MogrepsGSource, make_mogreps_g_source
 from nwp_archivist.products import PRODUCTS
 from nwp_archivist.recorder import DEFAULT_MIN_FREE_BYTES, Recorder, RecorderConfig
 from nwp_archivist.reporting import make_reporter
 from nwp_archivist.store import StoreLocation
 
 DEFAULT_CACHE_DIR: Final[str] = "/mnt/data/nwp-archive-cache"
+# Shared with any other product's recorder whose --cache-dir sits next to this one, so that two
+# recorders coordinate their backfill slices (see nwp_archivist.backfill_urgency).
+DEFAULT_BACKFILL_URGENCY_FILE_NAME: Final[str] = "nwp-archive-backfill-urgency.json"
 REQUEST_TIMEOUT_SECONDS: Final[float] = 60.0
 LOCK_FILE_NAME: Final[str] = ".lock"
 
@@ -67,7 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--fetch-processes",
         type=int,
         default=1,
-        help="Worker processes that fetch MOGREPS-UK files (1 means threads in this process).",
+        help=(
+            "Worker processes that fetch MOGREPS-UK or MOGREPS-G files (1 means threads in this "
+            "process)."
+        ),
     )
     parser.add_argument("--max-backfill-runs", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--workers", type=int, default=8, help="Files downloaded in parallel.")
@@ -82,6 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MIN_FREE_BYTES / 1024**3,
         help="Report a fault when the cache disk has less free space than this.",
+    )
+    parser.add_argument(
+        "--backfill-urgency-file",
+        default=None,
+        help=(
+            "Where this recorder and another product's recorder share how many days are left "
+            "before their oldest queued backfill run falls out of the provider's retention "
+            "window, so that the more urgent one gets this cycle's backfill slice (default: "
+            f"{DEFAULT_BACKFILL_URGENCY_FILE_NAME} next to --cache-dir)."
+        ),
     )
     return parser
 
@@ -111,21 +128,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     sources = {PRODUCTS[name].source for name in args.products}
     monitor_slug = args.monitor_slug or (
-        f"nwp-archive-{sources.pop()}" if len(sources) == 1 else "nwp-archive-record"
+        f"nwp-archive-{next(iter(sources))}" if len(sources) == 1 else "nwp-archive-record"
+    )
+    # The pool fetches one provider's files at a time, so a request naming only MOGREPS-G products
+    # gets the MOGREPS-G worker source; anything else (including a mix) gets the MOGREPS-UK one,
+    # which was the only choice before MOGREPS-G existed.
+    worker_source_factory = (
+        make_mogreps_g_source if sources == {"mogreps-g"} else make_mogreps_source
+    )
+    cache_dir = Path(args.cache_dir)
+    backfill_urgency_file = (
+        Path(args.backfill_urgency_file)
+        if args.backfill_urgency_file
+        else cache_dir.parent / DEFAULT_BACKFILL_URGENCY_FILE_NAME
     )
     config = RecorderConfig(
         store=StoreLocation(
             root=args.store_root,
             s3_endpoint_url=os.environ.get("ARCHIVE_S3_ENDPOINT_URL"),
         ),
-        cache_dir=Path(args.cache_dir),
+        cache_dir=cache_dir,
         min_free_bytes=int(args.min_free_gib * 1024**3),
         workers=args.workers,
         backfill_seconds=args.backfill_minutes * 60,
         fetch_processes=args.fetch_processes,
         max_backfill_runs=args.max_backfill_runs,
+        backfill_urgency_file=backfill_urgency_file,
     )
-    cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     # Two cycles at once could lose an Icechunk commit on local storage and corrupt cache files, so
     # only one process runs at a time. The lock is released when the process exits.
@@ -145,6 +174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fetcher=fetcher,
                 reporter=make_reporter(monitor_slug=monitor_slug),
                 mogreps_source=MogrepsSource(fetcher=fetcher),
+                worker_source_factory=worker_source_factory,
+                mogreps_g_source=MogrepsGSource(fetcher=fetcher),
             )
             try:
                 recorder.run_cycle([PRODUCTS[name] for name in args.products])
