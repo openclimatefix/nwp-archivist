@@ -35,11 +35,14 @@ def _write_atomically(path: Path, data: bytes) -> None:
 
 
 def _read_all(path: Path) -> dict[str, dict[str, object]]:
-    """Every product's last-written entry, or `{}` if the file is absent or unreadable."""
+    """Every product's last entry, or `{}` if absent, unreadable, or not a JSON object."""
     try:
-        return json.loads(path.read_text())
+        parsed = json.loads(path.read_text())
     except FileNotFoundError, OSError, ValueError:
         return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
 
 
 def write_urgency(path: Path, *, product: str, days_left: float, now: datetime) -> None:

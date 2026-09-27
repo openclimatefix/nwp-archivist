@@ -301,7 +301,7 @@ class Recorder:
         )[: self.config.max_backfill_runs]
         if self.config.backfill_urgency_file is not None:
             backfill_runs = self._apply_backfill_urgency(
-                product=product, backfill_runs=backfill_runs, now=now
+                product=product, backfill_runs=backfill_runs, now=now, ledger=ledger
             )
         backfill_end: float | None = None
         oldest_fetched: datetime | None = None
@@ -359,7 +359,12 @@ class Recorder:
         return clean
 
     def _apply_backfill_urgency(
-        self, *, product: Product, backfill_runs: list[datetime], now: datetime
+        self,
+        *,
+        product: Product,
+        backfill_runs: list[datetime],
+        now: datetime,
+        ledger: _FaultLedger,
     ) -> list[datetime]:
         """Write this product's backfill urgency, and empty the slice if another product is more.
 
@@ -367,22 +372,36 @@ class Recorder:
             product: The product about to spend a backfill slice.
             backfill_runs: The runs this cycle would otherwise backfill, oldest first.
             now: The time this cycle started.
+            ledger: Where a broken urgency file is reported, so it does not stop the live pass.
 
         Returns:
             `backfill_runs` unchanged, or `[]` when another product's fresher, more urgent entry
-            says this cycle's slice should go to it instead. The live pass is never affected.
+            says this cycle's slice should go to it instead. The live pass is never affected. A
+            broken urgency file (unreadable, unwritable, or holding something other than a JSON
+            object) is reported and treated the same as no signal: `backfill_runs` unchanged.
         """
         urgency_file = self.config.backfill_urgency_file
         if urgency_file is None:
             return backfill_runs
-        days_left = oldest_run_days_left(
-            oldest_backfill_run=backfill_runs[0] if backfill_runs else None,
-            lookback_hours=product.lookback_hours or self.config.lookback_hours,
-            now=now,
-        )
-        write_urgency(urgency_file, product=product.name, days_left=days_left, now=now)
-        if should_yield(urgency_file, product=product.name, my_days_left=days_left, now=now):
-            return []
+        try:
+            days_left = oldest_run_days_left(
+                oldest_backfill_run=backfill_runs[0] if backfill_runs else None,
+                lookback_hours=product.lookback_hours or self.config.lookback_hours,
+                now=now,
+            )
+            write_urgency(urgency_file, product=product.name, days_left=days_left, now=now)
+            if should_yield(urgency_file, product=product.name, my_days_left=days_left, now=now):
+                return []
+        except Exception as error:
+            logger.warning(
+                "backfill urgency file %s failed for %s", urgency_file, product.name, exc_info=True
+            )
+            ledger.report(
+                product=product.name,
+                init_time=None,
+                fault="run_error",
+                detail=f"backfill urgency file {urgency_file} failed: {error!r}",
+            )
         return backfill_runs
 
     @staticmethod

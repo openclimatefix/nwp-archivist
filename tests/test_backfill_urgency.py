@@ -61,6 +61,22 @@ def test_own_entry_is_never_compared_against_itself(tmp_path: Path) -> None:
     assert should_yield(path, product="mogreps-g", my_days_left=3.0, now=NOW) is False
 
 
+def test_a_non_object_json_file_never_yields(tmp_path: Path) -> None:
+    """Valid JSON that is not an object (a list, null, a bare number) is treated as no signal."""
+    path = tmp_path / "urgency.json"
+    for body in ("[]", "null", "3"):
+        path.write_text(body)
+        assert should_yield(path, product="mogreps-g", my_days_left=1.0, now=NOW) is False
+
+
+def test_write_urgency_over_a_non_object_json_file_does_not_raise(tmp_path: Path) -> None:
+    """Writing over a file that holds valid JSON of the wrong shape replaces it, without raising."""
+    path = tmp_path / "urgency.json"
+    path.write_text("[]")
+    write_urgency(path, product="mogreps-g", days_left=1.0, now=NOW)
+    assert should_yield(path, product="mogreps-uk", my_days_left=5.0, now=NOW) is True
+
+
 def test_write_urgency_keeps_the_other_products_entry(tmp_path: Path) -> None:
     """Writing one product's entry never overwrites another product's entry in the same file."""
     path = tmp_path / "urgency.json"
