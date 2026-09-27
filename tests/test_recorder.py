@@ -86,6 +86,35 @@ def test_a_complete_run_is_committed_complete_and_its_local_files_are_deleted(
     assert not cache.run(INIT).directory.exists()
 
 
+def test_a_broken_urgency_file_does_not_stop_the_live_run_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any failure writing or reading the urgency file still lets the cycle commit.
+
+    Regression test for the call site at `Recorder._run_product_with`: before the fix,
+    `_apply_backfill_urgency` was called with no `try`, before the live-run loop even started, so
+    a failure here aborted every product's cycle and the fault never got recorded.
+    """
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(recorder_module, "write_urgency", _raise)
+    urgency_file = tmp_path / "urgency.json"
+    provider = FakeProvider(TINY_EPS, published=_only_run())
+    recorder, reporter = build_recorder(
+        tmp_path,
+        provider,
+        Clock(SOON),
+        lookback_hours=LOOKBACK_ONE_RUN,
+        backfill_urgency_file=urgency_file,
+    )
+    assert recorder.run_cycle([TINY_EPS])
+    assert _status(tmp_path) == STATUS_COMPLETE
+    assert reporter.check_ins == [True]
+    assert reporter.kinds() == ["run_error"]
+
+
 def test_a_run_after_complete_fetches_nothing(tmp_path: Path) -> None:
     provider = FakeProvider(TINY_EPS, published=_only_run())
     recorder, _ = build_recorder(tmp_path, provider, Clock(SOON), lookback_hours=LOOKBACK_ONE_RUN)
