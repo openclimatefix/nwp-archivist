@@ -493,7 +493,108 @@ MOGREPS_UK: Final[Product] = Product(
     ),
 )
 
+# MOGREPS-G's surface fields (shortwave, 10 m wind) publish hourly to 132 h, then 3-hourly to 246 h.
+_MOGREPS_G_SURFACE_STEPS: Final[tuple[int, ...]] = _minutes(
+    (0, 132 * _H, _H), (135 * _H, 246 * _H, 3 * _H)
+)
+# MOGREPS-G's height-level wind fields publish hourly to only 54 h, then 3-hourly to 246 h.
+_MOGREPS_G_HEIGHT_STEPS: Final[tuple[int, ...]] = _minutes(
+    (0, 54 * _H, _H), (57 * _H, 246 * _H, 3 * _H)
+)
+_MOGREPS_G_HEIGHT_M: Final[int] = 100
+_MOGREPS_G_SW: Final[str] = "radiation_flux_in_shortwave_{}_downward_at_surface"
+
+MOGREPS_G: Final[Product] = Product(
+    name="mogreps-g",
+    provider="Met Office",
+    licence="CC BY-SA 4.0",
+    cycle_hours=6,
+    n_members=18,
+    fields=(
+        Field(
+            "shortwave_total",
+            _MOGREPS_G_SW.format("total"),
+            "surface_downwelling_shortwave_flux_in_air",
+            _MOGREPS_G_SURFACE_STEPS,
+        ),
+        Field(
+            "shortwave_direct",
+            _MOGREPS_G_SW.format("direct"),
+            "surface_direct_downwelling_shortwave_flux_in_air",
+            _MOGREPS_G_SURFACE_STEPS,
+        ),
+        Field(
+            "shortwave_diffuse",
+            _MOGREPS_G_SW.format("diffuse"),
+            "surface_diffusive_downwelling_shortwave_flux_in_air",
+            _MOGREPS_G_SURFACE_STEPS,
+        ),
+        # Unlike the other three, the net field's address has no "_downward" segment.
+        Field(
+            "shortwave_net",
+            "radiation_flux_in_shortwave_net_at_surface",
+            "net_downward_shortwave_flux_in_air",
+            _MOGREPS_G_SURFACE_STEPS,
+        ),
+        Field("wind_speed_10m", "wind_speed_at_10m", "wind_speed", _MOGREPS_G_SURFACE_STEPS),
+        Field(
+            "wind_direction_10m",
+            "wind_direction_at_10m",
+            "wind_from_direction",
+            _MOGREPS_G_SURFACE_STEPS,
+        ),
+        Field(
+            "wind_speed_100m",
+            "wind_speed_on_height_levels",
+            "wind_speed",
+            _MOGREPS_G_HEIGHT_STEPS,
+            _MOGREPS_G_HEIGHT_M,
+        ),
+        Field(
+            "wind_direction_100m",
+            "wind_direction_on_height_levels",
+            "wind_from_direction",
+            _MOGREPS_G_HEIGHT_STEPS,
+            _MOGREPS_G_HEIGHT_M,
+        ),
+    ),
+    hhl_levels=(),
+    # The first file of a run appears about 6.5 h after initialisation and the whole run by about
+    # 8 h.
+    start_delay_hours=6.5,
+    deadline_hours=24.0,
+    source="mogreps-g",
+    # The bucket deletes an object 30 days after it was written (rounded up to midnight UTC). A run
+    # with no file is `missing` only one day before its files could no longer be fetched.
+    lookback_hours=30 * 24.0,
+    missing_after_hours=29 * 24.0,
+    live_hours=24.0,
+    has_realizations=True,
+    notes=(
+        (
+            "shortwave_note",
+            (
+                "The shortwave files carry no cell_methods and no time bounds, and their time is "
+                "the valid time, so the values are taken to be instantaneous. Stored as delivered."
+            ),
+        ),
+        (
+            "generating_process_note",
+            "The Unified Model version from the file (13.8 is stored as 1308).",
+        ),
+        (
+            "grid_note",
+            (
+                "The cells are the rectangle of the Met Office 20 km global regular "
+                "latitude-longitude grid that contains the crop box, flattened row by row; "
+                "grid_shape is (rows, columns). Members are numbered 1 to 18 in file order; the "
+                "realization array holds the Met Office's own, 0-based, number for each."
+            ),
+        ),
+    ),
+)
+
 PRODUCTS: Final[dict[str, Product]] = {
     product.name: product
-    for product in (ICON_D2_EPS, ICON_D2, ICON_EU_EPS, ICON_ART_EU, MOGREPS_UK)
+    for product in (ICON_D2_EPS, ICON_D2, ICON_EU_EPS, ICON_ART_EU, MOGREPS_UK, MOGREPS_G)
 }
