@@ -20,6 +20,7 @@ from typing import Final
 
 import numpy as np
 
+from nwp_archivist.backfill_urgency import oldest_run_days_left, should_yield, write_urgency
 from nwp_archivist.cache import ProductCache, RunCache, RunGrid
 from nwp_archivist.dwd import DwdSource, Fetcher
 from nwp_archivist.mogreps import make_mogreps_source
@@ -116,6 +117,10 @@ class RecorderConfig:
         pool_live_timeout_seconds: How long a pass over a live run may take in the worker pool.
         pool_backfill_grace_seconds: How long a pass over an older run may take beyond the
             backfill budget. A pass that takes longer counts as a crash.
+        backfill_urgency_file: Where recorders of different products, each its own process, share
+            how many days are left before their oldest queued backfill run falls out of the
+            provider's retention window, or `None` to never yield a backfill slice to another
+            product. Missing, stale, or corrupt is the same as `None` for one cycle.
     """
 
     store: StoreLocation
@@ -130,6 +135,7 @@ class RecorderConfig:
     max_backfill_runs: int | None = None
     pool_live_timeout_seconds: float = 30 * 60.0
     pool_backfill_grace_seconds: float = 10 * 60.0
+    backfill_urgency_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +196,7 @@ class Recorder:
         clock: Callable[[], datetime] = _utc_now,
         mogreps_source: Source | None = None,
         worker_source_factory: Callable[[], Source] = make_mogreps_source,
+        mogreps_g_source: Source | None = None,
     ) -> None:
         """Build a recorder.
 
@@ -199,8 +206,10 @@ class Recorder:
             reporter: Where faults and the cycle check-in go.
             clock: Returns the current time, replaceable so that tests control time.
             mogreps_source: Reads MOGREPS-UK files, if that product is recorded.
-            worker_source_factory: Builds a worker process's own MOGREPS-UK source. It must be a
-                module-level function, so that it can be pickled.
+            mogreps_g_source: Reads MOGREPS-G files, if that product is recorded.
+            worker_source_factory: Builds a worker process's own MOGREPS-UK or MOGREPS-G source
+                (whichever the pool is fetching for). It must be a module-level function, so that
+                it can be pickled.
         """
         self.config = config
         self.reporter = reporter
@@ -210,6 +219,8 @@ class Recorder:
         }
         if mogreps_source is not None:
             self._sources["mogreps"] = mogreps_source
+        if mogreps_g_source is not None:
+            self._sources["mogreps-g"] = mogreps_g_source
         self._pool = (
             FetchPool(processes=config.fetch_processes, source_factory=worker_source_factory)
             if config.fetch_processes > 1
@@ -288,6 +299,10 @@ class Recorder:
             ),
             key=lambda run: (run.hour % 6 != 0, run.timestamp()),
         )[: self.config.max_backfill_runs]
+        if self.config.backfill_urgency_file is not None:
+            backfill_runs = self._apply_backfill_urgency(
+                product=product, backfill_runs=backfill_runs, now=now
+            )
         backfill_end: float | None = None
         oldest_fetched: datetime | None = None
         for init_time in (*live_runs, *backfill_runs):
@@ -342,6 +357,33 @@ class Recorder:
                 (now - oldest_fetched).total_seconds() / 3600,
             )
         return clean
+
+    def _apply_backfill_urgency(
+        self, *, product: Product, backfill_runs: list[datetime], now: datetime
+    ) -> list[datetime]:
+        """Write this product's backfill urgency, and empty the slice if another product is more.
+
+        Args:
+            product: The product about to spend a backfill slice.
+            backfill_runs: The runs this cycle would otherwise backfill, oldest first.
+            now: The time this cycle started.
+
+        Returns:
+            `backfill_runs` unchanged, or `[]` when another product's fresher, more urgent entry
+            says this cycle's slice should go to it instead. The live pass is never affected.
+        """
+        urgency_file = self.config.backfill_urgency_file
+        if urgency_file is None:
+            return backfill_runs
+        days_left = oldest_run_days_left(
+            oldest_backfill_run=backfill_runs[0] if backfill_runs else None,
+            lookback_hours=product.lookback_hours or self.config.lookback_hours,
+            now=now,
+        )
+        write_urgency(urgency_file, product=product.name, days_left=days_left, now=now)
+        if should_yield(urgency_file, product=product.name, my_days_left=days_left, now=now):
+            return []
+        return backfill_runs
 
     @staticmethod
     def _backing_off(run_cache: RunCache, *, now: datetime) -> bool:
@@ -438,7 +480,7 @@ class Recorder:
                     past_deadline=past_deadline,
                     stop=stop,
                     stop_at=stop_at,
-                    source_is_pooled=product.source == "mogreps",
+                    source_is_pooled=product.source in ("mogreps", "mogreps-g"),
                 )
                 mismatch = mismatch or changed
             received = run_cache.count_received(files, n_cells=len(grid.cell_index))

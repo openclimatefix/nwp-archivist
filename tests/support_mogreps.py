@@ -223,7 +223,7 @@ def build_mogreps_recorder(
             {}
             if worker_source_factory is None
             else {"worker_source_factory": worker_source_factory}
-        ),
+        ),  # ty: ignore[invalid-argument-type]
     )
     return recorder, reporter
 
