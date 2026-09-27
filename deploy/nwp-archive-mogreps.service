@@ -4,6 +4,10 @@
 # Settings (ARCHIVE_STORE_ROOT, optionally SENTRY_DSN) go in ~/.config/nwp-archive.env, which the
 # DWD service reads too. This service has its own cache directory, and so its own lock, so that a
 # long MOGREPS-UK backfill never makes the DWD service skip a cycle.
+# --backfill-urgency-file names a file shared only with the MOGREPS-G unit (see
+# nwp_archivist.backfill_urgency): whichever product is closer to losing a run to the bucket's
+# 30-day retention gets a cycle's backfill slice. The DWD unit does not pass this flag, so it never
+# reads or writes that file.
 [Unit]
 Description=Record one cycle of the MOGREPS-UK ensemble
 
@@ -16,7 +20,7 @@ EnvironmentFile=-%h/.config/nwp-archive.env
 # from speeding up the chunk-index reads; only this main process writes to the repository. The timer starts the
 # next cycle 1 minute after this one exits, so the backfill goes on in 10-minute slices and a new
 # run waits at most one slice.
-ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 10 --fetch-processes 4
+ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --products mogreps-uk --cache-dir /mnt/data/nwp-archive-cache-mogreps --backfill-minutes 10 --fetch-processes 4 --backfill-urgency-file /mnt/data/nwp-archive-backfill-urgency-mogreps.json
 # A hung cycle is killed after 3 hours. The cache directory's lock stops two cycles overlapping.
 TimeoutStartSec=3h
 # Four worker processes and the main process hold cropped runs of about 0.5 GB each in memory.

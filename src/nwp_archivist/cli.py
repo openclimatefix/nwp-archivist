@@ -25,9 +25,6 @@ from nwp_archivist.reporting import make_reporter
 from nwp_archivist.store import StoreLocation
 
 DEFAULT_CACHE_DIR: Final[str] = "/mnt/data/nwp-archive-cache"
-# Shared with any other product's recorder whose --cache-dir sits next to this one, so that two
-# recorders coordinate their backfill slices (see nwp_archivist.backfill_urgency).
-DEFAULT_BACKFILL_URGENCY_FILE_NAME: Final[str] = "nwp-archive-backfill-urgency.json"
 REQUEST_TIMEOUT_SECONDS: Final[float] = 60.0
 LOCK_FILE_NAME: Final[str] = ".lock"
 
@@ -97,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Where this recorder and another product's recorder share how many days are left "
             "before their oldest queued backfill run falls out of the provider's retention "
             "window, so that the more urgent one gets this cycle's backfill slice (default: "
-            f"{DEFAULT_BACKFILL_URGENCY_FILE_NAME} next to --cache-dir)."
+            "unset, so this recorder does not coordinate its backfill with any other product)."
         ),
     )
     return parser
@@ -137,11 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         make_mogreps_g_source if sources == {"mogreps-g"} else make_mogreps_source
     )
     cache_dir = Path(args.cache_dir)
-    backfill_urgency_file = (
-        Path(args.backfill_urgency_file)
-        if args.backfill_urgency_file
-        else cache_dir.parent / DEFAULT_BACKFILL_URGENCY_FILE_NAME
-    )
+    backfill_urgency_file = Path(args.backfill_urgency_file) if args.backfill_urgency_file else None
     config = RecorderConfig(
         store=StoreLocation(
             root=args.store_root,
