@@ -122,7 +122,7 @@ class Product:
         missing_after_hours: How long after the initialisation time a run with no file at all is
             recorded as `missing`, or `None` for the same as `deadline_hours`.
         live_hours: Runs younger than this are live and are handled first; older runs are a
-            backfill that the recorder handles newest first, within a time budget. `None` means
+            backfill that the recorder handles oldest first, within a time budget. `None` means
             every run is live.
         cell_chunk: The number of cells in one Zarr chunk, or `None` for all cells in one chunk.
         has_realizations: Whether the provider labels each member of a run with a realization

@@ -115,7 +115,7 @@ runs at 00, 06, 12, and 18 UTC come before the other hours.
   retention window, and each writes how many days are left before its oldest queued run is deleted
   to the JSON file. A recorder then skips its backfill slice for one cycle (the live runs still
   run) when the other recorder's entry is under an hour old and shows more than 0.5 days less
-  left. A missing, stale, or corrupt file counts as no signal. The MOGREPS-G and MOGREPS-UK units
+  left. A missing, stale, or corrupt file counts as no signal. The MOGREPS-G and MOGREPS-UK deploy units in this repository
   pass the same file and the DWD unit never passes the flag, so the DWD recorder neither reads nor
   writes it.
 
