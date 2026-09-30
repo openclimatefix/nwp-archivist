@@ -35,7 +35,12 @@ from nwp_archivist import mogreps as mogreps_module
 from nwp_archivist import recorder as recorder_module
 from nwp_archivist.cache import ProductCache
 from nwp_archivist.dwd import Fetcher
-from nwp_archivist.mogreps import LambertAzimuthalEqualArea, MogrepsSource, box_rectangle
+from nwp_archivist.mogreps import (
+    SEQUENCE_MINUTES,
+    LambertAzimuthalEqualArea,
+    MogrepsSource,
+    box_rectangle,
+)
 from nwp_archivist.products import (
     BOX_LAT_MAX,
     BOX_LAT_MIN,
@@ -108,6 +113,24 @@ def test_the_address_of_a_file_follows_the_bucket_layout() -> None:
         "/2026/09/23/T1200Z/20260923T1215Z-PT0000H15M-temperature_at_screen_level.nc"
     )
     assert ("shortwave_total", 0) not in urls
+
+
+def test_lead_times_in_the_same_sequence_block_share_a_sequence_key() -> None:
+    source = MogrepsSource(fetcher=Fetcher(client=httpx.Client()))
+    by_step = {
+        f.step_minutes: source.sequence_key(f)
+        for f in source.expected_files(MOGREPS_UK, INIT)
+        if f.field.variable == "wind_speed_100m" and f.member == 1
+    }
+    assert SEQUENCE_MINUTES == 8 * 60  # the documented 8-hour block
+    steps = sorted(by_step)
+    first_block = [step for step in steps if step < SEQUENCE_MINUTES]
+    second_block = [step for step in steps if SEQUENCE_MINUTES <= step < 2 * SEQUENCE_MINUTES]
+    assert len(first_block) > 1
+    assert len(second_block) > 1
+    assert {by_step[step] for step in first_block} == {by_step[0]}
+    assert {by_step[step] for step in second_block} == {by_step[second_block[0]]}
+    assert by_step[second_block[0]] != by_step[0]
 
 
 def test_temperature_has_15_minute_lead_times_for_the_first_12_hours_only() -> None:
