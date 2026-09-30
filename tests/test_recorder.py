@@ -1,10 +1,12 @@
 import errno
+import json
 import logging
 import re
 import shutil
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import numpy as np
@@ -606,3 +608,29 @@ def test_the_code_version_falls_back_to_the_package_version_without_git(
 
     monkeypatch.setattr(recorder_module.subprocess, "run", no_git)
     assert re.fullmatch(r"\d+\.\d+\.\d+", recorder_module.code_version())
+
+
+def test_urgency_is_written_for_the_oldest_unarchived_run_not_the_first_in_backfill_order(
+    tmp_path: Path,
+) -> None:
+    """A recent 6-hourly run sorts first in the backfill order but is not closest to expiry."""
+    urgency_file = tmp_path / "urgency.json"
+    recorder, _ = build_recorder(
+        tmp_path,
+        FakeProvider(TINY_EPS, published=_only_run()),
+        Clock(SOON),
+        backfill_urgency_file=urgency_file,
+    )
+    now = INIT + timedelta(days=10)
+    recent_six_hourly = now - timedelta(hours=7)
+    oldest_hourly = INIT + timedelta(hours=1)
+    recorder._apply_backfill_urgency(
+        product=TINY_EPS,
+        backfill_runs=[recent_six_hourly, oldest_hourly],
+        oldest_unarchived=oldest_hourly,
+        now=now,
+        ledger=MagicMock(),
+    )
+    days_left = json.loads(urgency_file.read_text())[TINY_EPS.name]["days_left"]
+    retention = timedelta(hours=TINY_EPS.lookback_hours or recorder.config.lookback_hours)
+    assert days_left == pytest.approx(((oldest_hourly + retention) - now).total_seconds() / 86400)

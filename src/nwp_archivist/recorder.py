@@ -291,17 +291,21 @@ class Recorder:
         ]
         # A backfill starts with the oldest run, because the provider deletes the oldest first. The
         # runs at 00, 06, 12 and 18 UTC come before the other hours.
-        backfill_runs = sorted(
-            (
-                run
-                for run in set(runs) - set(live_runs)
-                if not (_slot_archived(product, archived, run) or cache.is_done(run))
-            ),
-            key=lambda run: (run.hour % 6 != 0, run.timestamp()),
-        )[: self.config.max_backfill_runs]
+        unarchived = [
+            run
+            for run in set(runs) - set(live_runs)
+            if not (_slot_archived(product, archived, run) or cache.is_done(run))
+        ]
+        backfill_runs = sorted(unarchived, key=lambda run: (run.hour % 6 != 0, run.timestamp()))[
+            : self.config.max_backfill_runs
+        ]
         if self.config.backfill_urgency_file is not None:
             backfill_runs = self._apply_backfill_urgency(
-                product=product, backfill_runs=backfill_runs, now=now, ledger=ledger
+                product=product,
+                backfill_runs=backfill_runs,
+                oldest_unarchived=min(unarchived, default=None),
+                now=now,
+                ledger=ledger,
             )
         backfill_end: float | None = None
         oldest_fetched: datetime | None = None
@@ -363,6 +367,7 @@ class Recorder:
         *,
         product: Product,
         backfill_runs: list[datetime],
+        oldest_unarchived: datetime | None,
         now: datetime,
         ledger: _FaultLedger,
     ) -> list[datetime]:
@@ -370,7 +375,9 @@ class Recorder:
 
         Args:
             product: The product about to spend a backfill slice.
-            backfill_runs: The runs this cycle would otherwise backfill, oldest first.
+            backfill_runs: The runs this cycle would otherwise backfill.
+            oldest_unarchived: The oldest run still waiting to be backfilled, which is not
+                necessarily in `backfill_runs`, whose order puts the 6-hourly runs first.
             now: The time this cycle started.
             ledger: Where a broken urgency file is reported, so it does not stop the live pass.
 
@@ -385,7 +392,7 @@ class Recorder:
             return backfill_runs
         try:
             days_left = oldest_run_days_left(
-                oldest_backfill_run=backfill_runs[0] if backfill_runs else None,
+                oldest_backfill_run=oldest_unarchived,
                 lookback_hours=product.lookback_hours or self.config.lookback_hours,
                 now=now,
             )
