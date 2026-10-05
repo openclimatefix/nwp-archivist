@@ -1,0 +1,15 @@
+# systemd user unit: one recording cycle. The timer starts it every 15 minutes.
+# Install: copy this file and nwp-archive.timer to ~/.config/systemd/user/, then
+#   systemctl --user daemon-reload && systemctl --user enable --now nwp-archive.timer
+# Settings (ARCHIVE_STORE_ROOT, optionally SENTRY_DSN) go in ~/.config/nwp-archive.env.
+[Unit]
+Description=Record one cycle of DWD ensemble weather products
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/nwp-archivist
+EnvironmentFile=-%h/.config/nwp-archive.env
+ExecStart=%h/dev/nwp-archivist/.venv/bin/archive-record --cache-dir /mnt/data/nwp-archive-cache
+# The first cycle downloads many files. The timer does not start a second cycle while one runs.
+TimeoutStartSec=infinity
+Nice=10

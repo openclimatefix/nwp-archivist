@@ -1,0 +1,11 @@
+# systemd user timer: run nwp-archive-mogreps-g.service 2 minutes after boot, then 1 minute after
+# each cycle exits, so that the backfill of older runs goes on in slices.
+[Unit]
+Description=Record MOGREPS-G, one cycle after another
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target

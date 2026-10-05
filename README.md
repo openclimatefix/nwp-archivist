@@ -1,14 +1,172 @@
 # nwp-archivist
 
-An always-on recorder of ensemble numerical weather prediction (NWP) products that their providers delete within 24 hours to 33 days, published as Zarr stores on [Source Cooperative](https://source.coop).
-
-The recorder covers the DWD ICON-EU-EPS, ICON-D2-EPS, ICON-D2, and ICON-ART-EU products, and later the Met Office MOGREPS-UK ensemble, cropped to Great Britain and its surrounding seas.
-
-This repository holds no code yet. The plan and its reviews are in [openclimatefix/nged-substation-forecast#926](https://github.com/openclimatefix/nged-substation-forecast/issues/926).
+An always-on recorder of ensemble numerical weather prediction (NWP) products that their providers
+delete within 24 hours to 33 days. It records the DWD ICON-EU-EPS, ICON-D2-EPS, ICON-D2, and
+ICON-ART-EU products, cropped to Great Britain and its surrounding seas (49.0-61.5 N, 10.0 W-3.5 E),
+into one [Icechunk](https://icechunk.io) repository per product. It also records the Met Office
+MOGREPS-UK ensemble (`mogreps-uk`, 3 members, hourly runs to 126 hours) as a separate product
+because of its licence. The design, its reviews, and the plan are in
+[openclimatefix/nged-substation-forecast#926](https://github.com/openclimatefix/nged-substation-forecast/issues/926).
 
 ## Licences
 
-The code is MIT licensed (see `LICENSE`). The archived data keeps the licence of its provider: DWD data is CC BY 4.0, and Met Office MOGREPS-UK data is CC BY-SA 4.0.
+The code is MIT licensed (see `LICENSE`). The archived data keeps the licence of its provider: DWD
+data is CC BY 4.0 (attribute the Deutscher Wetterdienst), and Met Office MOGREPS-UK data is CC
+BY-SA 4.0.
+
+## How to run
+
+`archive-record` runs one recording cycle and exits. A systemd timer runs it every 15 minutes.
+
+```bash
+uv sync
+export ARCHIVE_STORE_ROOT=/mnt/data/nwp-archive   # or an s3:// prefix
+uv run archive-record --cache-dir /mnt/data/nwp-archive-cache
+```
+
+- `--store-root` (or `ARCHIVE_STORE_ROOT`) is a local directory or an `s3://bucket/prefix`
+  address. Each product is the repository `<root>/<product name>`.
+- `--cache-dir` holds cropped files until their run is committed (default
+  `/mnt/data/nwp-archive-cache`).
+- `SENTRY_DSN`, when set, sends faults and a cron check-in to Sentry. Without it, faults are logged
+  at WARNING and the check-in does nothing.
+- `deploy/nwp-archive.service` and `deploy/nwp-archive.timer` are systemd user units for a
+  workstation. Run `loginctl enable-linger` so that they run while nobody is logged in.
+
+Each cycle logs one line per examined run to standard output: the product, the init time, the
+number of files expected and received, and the state (`waiting`, `complete`, `partial`, or
+`missing`).
+
+If a product's grid, member count, or step list differs from the archive's, the recorder stops
+committing that product, reports one `grid_changed` fault, and creates `<cache-dir>/<product>/HALTED`.
+Delete that file once a person has decided what to do.
+
+## MOGREPS-UK
+
+`archive-record --products mogreps-uk` records the Met Office's public bucket
+`met-office-uk-ensemble-model-data`, which deletes each file about 30 days after it was written. The
+`deploy/nwp-archive-mogreps.service` and `.timer` run it as a chain of cycles, each starting 1 minute
+after the last exits, with a cache directory and a Sentry cron monitor (`nwp-archive-mogreps`) of
+their own. The DWD service uses the monitor `nwp-archive-dwd`. Override either with `--monitor-slug`.
+
+- **Fields**, all as delivered: total, direct, and diffuse downward shortwave at the surface, screen
+  temperature, 10 m wind speed and direction, total cloud amount, and wind speed and direction at
+  100 m. Shortwave has no lead time 0 and carries no `cell_methods` or time bounds, so it is taken
+  to be instantaneous.
+- **Grid:** the native 2 km grid, cut to the smallest rectangle of rows and columns that contains
+  the crop box (707 rows by 494 columns), flattened row by row into the `cell` dimension. The
+  `grid_shape` attribute holds the rows and columns.
+- **Members** are numbered 1 to 3 in file order. The `realization` array holds the Met Office's
+  number for each member, which changes from run to run.
+- **Reading** downloads only the chunks that overlap the rectangle, by byte range. One measured run
+  took 5.5 GB of downloads in 54,000 requests and 29 minutes with 8 threads, and became 1.06 GB of
+  archive.
+- **Fetching:** `--fetch-processes 4` runs four worker processes, because h5py's global lock
+  serialises the chunk-index reads and threads do not speed them up. Workers only write cropped
+  files to the local cache. The main process alone commits to the repository, updates the status,
+  and reports faults.
+- **Backfill:** each cycle handles the runs from the last 6 hours first. It then spends at most
+  `--backfill-minutes` (default 15; the service uses 10) on older runs still in the bucket, oldest
+  first, because the bucket deletes those first. The runs at 00, 06, 12 and 18 UTC come before the
+  other hours. A run cut short by the slice stays waiting and
+  resumes in the next cycle. A run older than 24 hours is committed `partial` only after a full
+  pass has tried every missing file, and a run with no file at all is recorded `missing` only 29
+  days after its initialisation time, looked at again meanwhile after a delay that doubles from 30
+  minutes to 12 hours.
+
+## MOGREPS-Global
+
+`archive-record --products mogreps-g` records the Met Office's public bucket
+`met-office-global-ensemble-model-data` as the product `mogreps-g`, under the same licence as
+MOGREPS-UK (CC BY-SA 4.0). It differs from MOGREPS-UK in these ways:
+
+- **Runs:** 18 members, one run every 6 hours (`mogreps-uk` has 3 members and an hourly run). The
+  first file of a run appears about 6.5 hours after initialisation.
+- **Grid:** the global 20 km regular latitude-longitude grid, cut to the smallest rectangle of rows
+  and columns that contains the crop box (67 rows by 48 columns). Both products share one file
+  reader, so the member numbering, the `realization` array, and `--fetch-processes` behave as in
+  the MOGREPS-UK section. MOGREPS-G has no temperature or cloud field and adds a net shortwave
+  field (`shortwave_net`).
+- **Retention:** the bucket deletes each file about 30 days after it was written, as for MOGREPS-UK.
+  Runs younger than 24 hours are live, against 6 hours for MOGREPS-UK.
+- **Service:** `deploy/nwp-archive-mogreps-g.service` and `.timer`, with a cache directory of their
+  own so that a long backfill never makes another service skip a cycle.
+
+## Lookback and backfill
+
+**A cycle looks back over a window of runs and archives every run in it that is not yet
+archived.** The window starts `lookback_hours` before now. It is 27 hours by default, and 30 days
+for the two MOGREPS products, whose bucket keeps files that long. It ends when a run's first file
+is expected, `start_delay_hours` before now.
+
+**Live runs come first, then older runs are backfilled within a time budget.** A run younger than
+the product's live window is live: all of the DWD runs, 6 hours for MOGREPS-UK, and 24 hours for
+MOGREPS-G. Live runs are handled without a time limit. The unarchived runs older than that are the
+backfill, and are handled oldest first, because the provider deletes the oldest files first. The
+runs at 00, 06, 12, and 18 UTC come before the other hours.
+
+- `--backfill-minutes` (default 15) is how long a cycle may spend on the backfill. The clock starts
+  once the live runs are done. A run cut short by the budget stays waiting and resumes in the next
+  cycle. The MOGREPS services use 10.
+- `--max-backfill-runs` (hidden from `--help`, default no limit) is the most unarchived runs a
+  cycle backfills, which is useful for a trial run.
+- `--backfill-urgency-file` is opt-in and off by default, which leaves the product's backfill
+  independent of every other product. Give it to two recorders that compete for the same
+  provider's retention window, and each writes how many days are left before its oldest queued run
+  is deleted to the JSON file. A recorder then skips its backfill slice for one cycle (the live
+  runs still run) when the other recorder's entry is under an hour old and shows more than 0.5
+  days less left. A missing, stale, or corrupt file counts as no signal. The MOGREPS-G and
+  MOGREPS-UK deploy units in this repository pass the same file and the DWD unit never passes the
+  flag, so the DWD recorder neither reads nor writes it.
+
+## Faults
+
+**Every fault goes to the reporter: a Sentry event when `SENTRY_DSN` is set, and a WARNING log
+line otherwise.** The event carries the product, the init time of the run, and the fault type as
+tags, and its fingerprint is the fault type, product, and init time, so an alert rule fires once per
+run. The fault types are `partial`, `missing`, `grid_changed`, `commit_failed`, `run_error`,
+`disk_low`, and `grid_unchecked`.
+
+**A fault ledger stops a fault that persists from raising an event every cycle.** The ledger applies
+to `commit_failed`, `run_error`, `disk_low`, and `grid_unchecked`. It keeps the keys (fault type and
+init time) of the faults reported so far in `<cache-dir>/<product>/active_faults.json`, because each
+cycle is a new process. A cycle reports a fault only if the previous cycle did not report the same
+key. A key missing from a cycle leaves the file, so the fault is reported again if it returns.
+`partial`, `missing`, and `grid_changed` are reported once, when the run reaches that state.
+
+**A `run_error` fault means that handling one run raised an exception.** The recorder logs the
+traceback, reports `run_error` with the exception in the detail, marks the cycle as not clean, and
+carries on with the next run. It also reports `run_error`, with no init time, when the file given
+to `--backfill-urgency-file` cannot be read or written, and it then backfills as if that flag were
+unset.
+
+## Reading the archive
+
+Each variable is one array with dimensions `(init_time, member, step, cell)`, or `(init_time,
+step, cell)` for a deterministic product. Open a repository with `icechunk` and `xarray`:
+
+```python
+import icechunk
+import xarray as xr
+
+repo = icechunk.Repository.open(
+    icechunk.local_filesystem_storage("/mnt/data/nwp-archive/icon-d2-eps")
+)
+session = repo.readonly_session("main")
+dataset = xr.open_zarr(session.store, consolidated=False, decode_timedelta=True)
+```
+
+The `status` array says whether each `init_time` slot is `complete` (1), `partial` (2), or `missing`
+(3); 0 means never archived. The `step` coordinate is in minutes, and a variable that lacks a
+lead time has NaN at that position. Shortwave radiation (`ASWDIR_S`, `ASWDIFD_S`) is an average
+since the start of the run, as delivered.
+
+## Tests
+
+```bash
+uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest
+uv run pytest --run-network -m network   # fetches three real files from DWD
+```
 
 ## Contributing
 
