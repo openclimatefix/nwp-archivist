@@ -27,7 +27,7 @@ from support import (
 )
 
 from nwp_archivist import recorder as recorder_module
-from nwp_archivist.cache import ProductCache, RunCache
+from nwp_archivist.cache import ProductCache, RunCache, RunGrid
 from nwp_archivist.products import ExpectedFile, Product, expected_files, run_directory
 from nwp_archivist.recorder import RecorderConfig
 from nwp_archivist.store import (
@@ -634,3 +634,35 @@ def test_urgency_is_written_for_the_oldest_unarchived_run_not_the_first_in_backf
     days_left = json.loads(urgency_file.read_text())[TINY_EPS.name]["days_left"]
     retention = timedelta(hours=TINY_EPS.lookback_hours or recorder.config.lookback_hours)
     assert days_left == pytest.approx(((oldest_hourly + retention) - now).total_seconds() / 86400)
+
+
+def test_a_run_cached_with_only_cell_coordinates_does_not_create_the_layout(tmp_path: Path) -> None:
+    """The layout stores the static fields once, so it must come from a grid that has them all."""
+    clock = Clock(SOON)
+    provider = FakeProvider(TINY_EPS, published=lambda _file: False)
+    recorder, _ = build_recorder(tmp_path, provider, clock, lookback_hours=LOOKBACK_ONE_RUN)
+    recorder.run_cycle([TINY_EPS])
+    run_cache = _cache(tmp_path).run(INIT)
+    grid = run_cache.load_grid()
+    assert grid is not None
+    run_cache.save_grid(
+        RunGrid(
+            n_points=grid.n_points,
+            cell_index=grid.cell_index,
+            statics={name: grid.statics[name] for name in ("clat", "clon")},
+        )
+    )
+
+    provider = FakeProvider(TINY_EPS, published=_only_run(), static_available=False)
+    recorder, reporter = build_recorder(tmp_path, provider, clock, lookback_hours=LOOKBACK_ONE_RUN)
+    assert recorder.run_cycle([TINY_EPS])
+    assert not _store(tmp_path).has_layout()
+    assert reporter.faults == []
+
+    provider = FakeProvider(TINY_EPS, published=_only_run())
+    recorder, _ = build_recorder(tmp_path, provider, clock, lookback_hours=LOOKBACK_ONE_RUN)
+    assert recorder.run_cycle([TINY_EPS])
+    assert _status(tmp_path) == STATUS_COMPLETE
+    session = _store(tmp_path).repository.readonly_session(branch="main")
+    archive = zarr.open_group(session.store, mode="r")
+    assert {"hsurf", "fr_land"} <= set(archive.array_keys())
