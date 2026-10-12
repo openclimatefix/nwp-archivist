@@ -1,10 +1,11 @@
 from datetime import UTC, datetime
 
 from nwp_archivist.products import (
-    ICON_ART_EU,
+    ICON_ART_EU_10KM,
     ICON_D2,
     ICON_D2_EPS,
-    ICON_EU_EPS,
+    ICON_EU_EPS_10KM,
+    PRODUCTS,
     Product,
     expected_files,
     run_init_times,
@@ -43,19 +44,19 @@ def test_icon_d2_radiation_has_193_steps_and_temperature_49() -> None:
 
 
 def test_icon_art_eu_step_lists() -> None:
-    assert _count(ICON_ART_EU, "TAOD_DUST") == 89
-    assert _count(ICON_ART_EU, "ASOB_S_CS") == 64
-    assert _count(ICON_ART_EU, "T_2M") == 75
+    assert _count(ICON_ART_EU_10KM, "TAOD_DUST") == 89
+    assert _count(ICON_ART_EU_10KM, "ASOB_S_CS") == 64
+    assert _count(ICON_ART_EU_10KM, "T_2M") == 75
 
 
 def test_icon_eu_eps_step_lists() -> None:
-    assert _count(ICON_EU_EPS, "T_2M") == 40 * 91
-    assert _count(ICON_EU_EPS, "U_L72") == 40 * 64
+    assert _count(ICON_EU_EPS_10KM, "T_2M") == 40 * 91
+    assert _count(ICON_EU_EPS_10KM, "U_L72") == 40 * 64
 
 
 def test_padded_step_axis_is_the_longest_field() -> None:
     assert ICON_D2.max_steps == 193
-    assert ICON_EU_EPS.max_steps == 91
+    assert ICON_EU_EPS_10KM.max_steps == 91
 
 
 def test_surface_url_matches_the_provider_layout() -> None:
@@ -89,14 +90,29 @@ def test_static_urls_of_an_ensemble_use_member_one() -> None:
 
 
 def test_static_urls_of_a_deterministic_product_have_no_member() -> None:
-    urls = static_urls(ICON_ART_EU, INIT)
+    urls = static_urls(ICON_ART_EU_10KM, INIT)
     assert "/e/" not in urls["clat"]
     assert set(urls) == {"clat", "clon", "hsurf", "fr_land"}
 
 
+def test_the_10km_products_are_fetched_from_the_directories_dwd_kept() -> None:
+    eps_url = static_urls(ICON_EU_EPS_10KM, INIT)["clat"]
+    art_url = static_urls(ICON_ART_EU_10KM, INIT)["clat"]
+    assert "/icon-eu-eps/p/CLAT/" in eps_url
+    assert "/icon-art-eu/p/CLAT/" in art_url
+    assert {
+        f.url.split("/p/")[0].rsplit("/", 1)[1] for f in expected_files(ICON_EU_EPS_10KM, INIT)
+    } == {"icon-eu-eps"}
+
+
+def test_the_registry_holds_the_10km_names_and_no_13km_product() -> None:
+    assert {"icon-eu-eps-10km", "icon-art-eu-10km"} <= set(PRODUCTS)
+    assert {"icon-eu-eps", "icon-art-eu"}.isdisjoint(PRODUCTS)
+
+
 def test_run_init_times_follow_the_cycle() -> None:
     times = run_init_times(
-        ICON_EU_EPS,
+        ICON_EU_EPS_10KM,
         first=datetime(2026, 9, 24, 13, tzinfo=UTC),
         last=datetime(2026, 9, 25, 12, tzinfo=UTC),
     )

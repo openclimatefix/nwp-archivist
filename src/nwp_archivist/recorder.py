@@ -529,6 +529,14 @@ class Recorder:
         if cache.halted() is not None:
             self._log_run(product, init_time, len(files), received, "halted")
             return _RunOutcome(clean=False, n_fetched=n_fetched)
+        if grid is not None and not (
+            store.has_layout() or source.static_names(product) <= grid.statics.keys()
+        ):
+            # The first commit fixes the layout, and the layout stores the static fields once. A run
+            # cached while the archive held another grid has only the cell coordinates, so it waits
+            # for a run that can still fetch the full set.
+            self._log_run(product, init_time, len(files), received, "waiting")
+            return _RunOutcome(clean=True, n_fetched=n_fetched)
         self._log_run(product, init_time, len(files), received, STATUS_NAMES[status])
         if grid is None:
             # Nothing can be written without a grid, and a first run has none to write.

@@ -11,7 +11,7 @@ from nwp_archivist.mogreps import MogrepsSource
 from nwp_archivist.products import (
     ICON_D2,
     ICON_D2_EPS,
-    ICON_EU_EPS,
+    ICON_EU_EPS_10KM,
     MOGREPS_UK,
     Product,
     expected_files,
@@ -31,7 +31,7 @@ def _recent_run(product: Product) -> datetime:
     )
 
 
-@pytest.mark.parametrize("product", [ICON_D2_EPS, ICON_EU_EPS, ICON_D2], ids=lambda p: p.name)
+@pytest.mark.parametrize("product", [ICON_D2_EPS, ICON_EU_EPS_10KM, ICON_D2], ids=lambda p: p.name)
 def test_a_real_temperature_field_decodes_and_is_in_range(product: Product) -> None:
     init_time = _recent_run(product)
     (file,) = [

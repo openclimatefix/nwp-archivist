@@ -1,8 +1,9 @@
 # nwp-archivist
 
 An always-on recorder of ensemble numerical weather prediction (NWP) products that their providers
-delete within 24 hours to 33 days. It records the DWD ICON-EU-EPS, ICON-D2-EPS, ICON-D2, and
-ICON-ART-EU products, cropped to Great Britain and its surrounding seas (49.0-61.5 N, 10.0 W-3.5 E),
+delete within 24 hours to 33 days. It records the DWD ICON-EU-EPS (`icon-eu-eps-10km`),
+ICON-D2-EPS, ICON-D2, and ICON-ART-EU (`icon-art-eu-10km`) products, cropped to Great Britain and
+its surrounding seas (49.0-61.5 N, 10.0 W-3.5 E),
 into one [Icechunk](https://icechunk.io) repository per product. It also records the Met Office
 MOGREPS-UK ensemble (`mogreps-uk`, 3 members, hourly runs to 126 hours) as a separate product
 because of its licence. The design, its reviews, and the plan are in
@@ -40,6 +41,17 @@ number of files expected and received, and the state (`waiting`, `complete`, `pa
 If a product's grid, member count, or step list differs from the archive's, the recorder stops
 committing that product, reports one `grid_changed` fault, and creates `<cache-dir>/<product>/HALTED`.
 Delete that file once a person has decided what to do.
+
+### When DWD changes a product's grid
+
+One repository holds one grid, so a new grid gets a new product whose name ends in the grid's
+resolution. DWD changed the grids of ICON-EU-EPS and ICON-ART-EU from 13 km to 10 km at the
+06:00 UTC run of 2026-10-06. The runs before that are in the repositories `icon-eu-eps-13km` and
+`icon-art-eu-13km`, which the recorder no longer writes to, and the runs from then on are in
+`icon-eu-eps-10km` and `icon-art-eu-10km`. DWD kept its own directory names `icon-eu-eps` and
+`icon-art-eu`, which `Product.dwd_directory` records. Runs that a halted product fetched stay in the
+cache folder, so moving that folder to the new product's name (and deleting `HALTED`) lets the next
+cycle commit them.
 
 ## MOGREPS-UK
 
