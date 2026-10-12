@@ -106,7 +106,8 @@ class Product:
     """A weather product archived as one Icechunk repository.
 
     Attributes:
-        name: The product name, which is also the DWD directory name and the repository name.
+        name: The product name, which is also the repository name and, unless `dwd_directory` is
+            set, the DWD directory name.
         provider: The organisation that publishes the product.
         licence: The licence of the published data.
         cycle_hours: The hours between two runs.
@@ -128,6 +129,9 @@ class Product:
         has_realizations: Whether the provider labels each member of a run with a realization
             number that changes from run to run, which the archive then stores.
         notes: Attributes written to the archive's root group, saying what the fields mean.
+        dwd_directory: The product's directory on DWD's server, when that differs from `name`. DWD
+            keeps the directory name when it changes a product's grid, and the archive names the
+            grid's resolution so that each repository holds one grid.
     """
 
     name: str
@@ -146,6 +150,7 @@ class Product:
     cell_chunk: int | None = None
     has_realizations: bool = False
     notes: tuple[tuple[str, str], ...] = ()
+    dwd_directory: str | None = None
 
     @property
     def members(self) -> tuple[int | None, ...]:
@@ -220,8 +225,9 @@ def _url(
     """Assemble one file's address following DWD's open-data directory layout."""
     level_path = "" if level is None else f"/{_MODEL_LEVEL_PATH}/{level}"
     member_path = "" if member is None else f"/e/{member:02d}"
+    directory = product.dwd_directory or product.name
     return (
-        f"{base_url}/{product.name}/p/{parameter}{level_path}/r/{run_directory(init_time)}"
+        f"{base_url}/{directory}/p/{parameter}{level_path}/r/{run_directory(init_time)}"
         f"{member_path}/s/{step_file_name(step_minutes)}"
     )
 
@@ -369,8 +375,9 @@ ICON_D2: Final[Product] = Product(
     notes=_DWD_NOTES,
 )
 
-ICON_EU_EPS: Final[Product] = Product(
-    name="icon-eu-eps",
+ICON_EU_EPS_10KM: Final[Product] = Product(
+    name="icon-eu-eps-10km",
+    dwd_directory="icon-eu-eps",
     provider="DWD",
     licence="CC BY 4.0",
     cycle_hours=6,
@@ -384,8 +391,9 @@ ICON_EU_EPS: Final[Product] = Product(
     notes=_DWD_NOTES,
 )
 
-ICON_ART_EU: Final[Product] = Product(
-    name="icon-art-eu",
+ICON_ART_EU_10KM: Final[Product] = Product(
+    name="icon-art-eu-10km",
+    dwd_directory="icon-art-eu",
     provider="DWD",
     licence="CC BY 4.0",
     cycle_hours=6,
@@ -596,5 +604,5 @@ MOGREPS_G: Final[Product] = Product(
 
 PRODUCTS: Final[dict[str, Product]] = {
     product.name: product
-    for product in (ICON_D2_EPS, ICON_D2, ICON_EU_EPS, ICON_ART_EU, MOGREPS_UK, MOGREPS_G)
+    for product in (ICON_D2_EPS, ICON_D2, ICON_EU_EPS_10KM, ICON_ART_EU_10KM, MOGREPS_UK, MOGREPS_G)
 }
